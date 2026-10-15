@@ -1,0 +1,97 @@
+name: python
+
+on:
+  push:
+    branches: [main]
+    paths: ['python/**', 'spec/**', '.github/workflows/python.yml']
+  pull_request:
+    paths: ['python/**', 'spec/**', '.github/workflows/python.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: python
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --upgrade build pyflakes
+      - run: python -m pyflakes vault_env_loader.py tests
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: python/dist/
+
+  test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -W error -m unittest discover -s tests -t tests -v
+
+  legacy:
+    # setup-python has no 3.6 / 3.7 / 3.8 for current runners: use the official images.
+    # Installs the wheel built above with the old pip, then runs the tests.
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.6', '3.7', '3.8']
+    runs-on: ubuntu-latest
+    container: python:${{ matrix.python }}-slim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: python/dist/
+      - run: python --version && pip --version
+      - run: pip install dist/*.whl && vault-env-loader --version
+      - run: python -W error -m unittest discover -s tests -t tests -v
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -W error -m unittest discover -s tests -t tests -v
+
+  vault:
+    # Against a real HashiCorp Vault dev server (KV v1 and v2, policies, token metadata).
+    runs-on: ubuntu-latest
+    services:
+      vault:
+        image: hashicorp/vault:1.17
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: root
+        ports: ['8200:8200']
+        options: --cap-add=IPC_LOCK
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Wait for Vault
+        run: for i in $(seq 1 30); do curl -fs http://127.0.0.1:8200/v1/sys/health && break; sleep 1; done
+      - run: python -m unittest tests/test_vault.py -v
+        env:
+          VAULT_IT_ADDR: http://127.0.0.1:8200
+          VAULT_IT_ROOT_TOKEN: root

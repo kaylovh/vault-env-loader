@@ -1,0 +1,50 @@
+name: python-release
+
+# Push a tag like python-v0.1.0 to publish python/ to PyPI.
+# PyPI Trusted Publishing (OIDC): no PyPI token is stored in this repository,
+# and the upload carries digital attestations. Configure it once on pypi.org —
+# for a project that does not exist yet as a "pending publisher" (Account ->
+# Publishing): project vault-env-loader, owner kaylovh, repository
+# vault-env-loader, workflow python-release.yml, environment pypi.
+on:
+  push:
+    tags: ['python-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Tag matches __version__
+        run: |
+          tag="${GITHUB_REF_NAME#python-v}"
+          lib="$(python -c 'import vault_env_loader; print(vault_env_loader.__version__)')"
+          test "$tag" = "$lib" || { echo "tag $tag, vault_env_loader.__version__ $lib"; exit 1; }
+      - run: python -m unittest discover -s tests -t tests
+      - run: python -m pip install --upgrade build && python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: python/dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
