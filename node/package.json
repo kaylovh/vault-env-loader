@@ -1,0 +1,24 @@
+{
+  "name": "vault-env-loader",
+  "version": "0.1.0",
+  "description": "Load HashiCorp Vault KV secrets into environment variables before your app starts. Zero dependencies.",
+  "keywords": ["vault", "hashicorp", "secrets", "env", "environment", "dotenv", "kv", "config"],
+  "license": "MIT",
+  "author": "Kaylov H",
+  "repository": { "type": "git", "url": "git+https://github.com/kaylovh/vault-env-loader.git", "directory": "node" },
+  "homepage": "https://github.com/kaylovh/vault-env-loader/tree/main/node#readme",
+  "bugs": "https://github.com/kaylovh/vault-env-loader/issues",
+  "engines": { "node": ">=14" },
+  "main": "./index.cjs",
+  "types": "./index.d.ts",
+  "bin": { "vault-env-loader": "index.cjs" },
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.cjs" },
+    "./register": { "import": "./register.mjs", "require": "./register.cjs" },
+    "./package.json": "./package.json"
+  },
+  "files": ["index.cjs", "index.d.ts", "register.cjs", "register.mjs"],
+  "scripts": {
+    "test": "node --test test/spec.test.cjs test/client.test.cjs test/vault.test.cjs && node test/smoke.cjs"
+  }
+}

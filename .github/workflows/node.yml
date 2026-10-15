@@ -1,0 +1,76 @@
+name: node
+
+on:
+  push:
+    branches: [main]
+    paths: ['node/**', 'spec/**', '.github/workflows/node.yml']
+  pull_request:
+    paths: ['node/**', 'spec/**', '.github/workflows/node.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: node
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22, 24]
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test test/spec.test.cjs test/client.test.cjs
+      - run: node test/smoke.cjs
+
+  legacy:
+    # node:test does not exist before 18: smoke-test the three entry points only.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [14, 16]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node test/smoke.cjs
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test test/spec.test.cjs test/client.test.cjs
+
+  vault:
+    # Against a real HashiCorp Vault dev server (KV v1 and v2, policies, token metadata).
+    runs-on: ubuntu-latest
+    services:
+      vault:
+        image: hashicorp/vault:1.17
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: root
+        ports: ['8200:8200']
+        options: --cap-add=IPC_LOCK
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Wait for Vault
+        run: for i in $(seq 1 30); do curl -fs http://127.0.0.1:8200/v1/sys/health && break; sleep 1; done
+      - run: node --test test/vault.test.cjs
+        env:
+          VAULT_IT_ADDR: http://127.0.0.1:8200
+          VAULT_IT_ROOT_TOKEN: root

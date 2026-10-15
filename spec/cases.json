@@ -1,0 +1,66 @@
+{
+  "$comment": "Shared conformance cases. The Node and Python implementations both run every case here; change behaviour here first.",
+  "envName": [
+    { "key": "DB_PASSWORD", "mode": "auto", "expect": "DB_PASSWORD" },
+    { "key": "db.password", "mode": "auto", "expect": "DB_PASSWORD" },
+    { "key": "spring.datasource.url", "mode": "auto", "expect": "SPRING_DATASOURCE_URL" },
+    { "key": "database_url", "mode": "auto", "expect": "database_url" },
+    { "key": "api-key", "mode": "auto", "expect": "API_KEY" },
+    { "key": "9lives", "mode": "auto", "expect": "_9LIVES" },
+    { "key": "a b/c", "mode": "auto", "expect": "A_B_C" },
+    { "key": "DB_PASSWORD", "mode": "verbatim", "expect": "DB_PASSWORD" },
+    { "key": "db.password", "mode": "verbatim", "expect": "db.password" },
+    { "key": "database_url", "mode": "verbatim", "expect": "database_url" },
+    { "key": "db.password", "mode": "upper", "expect": "DB_PASSWORD" },
+    { "key": "database_url", "mode": "upper", "expect": "DATABASE_URL" },
+    { "key": "camelCase", "mode": "upper", "expect": "CAMELCASE" }
+  ],
+  "mapEntries": [
+    { "name": "prefix applied after mapping", "data": { "host": "h", "db.port": "5432" }, "prefix": "PG_", "mode": "auto",
+      "expect": { "PG_host": "h", "PG_DB_PORT": "5432" } },
+    { "name": "non-string values become JSON", "data": { "n": 5, "b": true, "o": { "a": 1 }, "z": null }, "prefix": "", "mode": "auto",
+      "expect": { "n": "5", "b": "true", "o": "{\"a\":1}", "z": "" } },
+    { "name": "dot and dash collide", "data": { "db.password": "x", "db-password": "y" }, "prefix": "", "mode": "auto",
+      "error": "collision" },
+    { "name": "auto keeps valid names, so case differs only", "data": { "database_url": "x", "DATABASE_URL": "y" }, "prefix": "", "mode": "auto",
+      "expect": { "database_url": "x", "DATABASE_URL": "y" } },
+    { "name": "same case-different names collide where names are case-insensitive", "data": { "database_url": "x", "DATABASE_URL": "y" }, "prefix": "", "mode": "auto",
+      "caseInsensitive": true, "error": "collision" },
+    { "name": "upper makes them collide", "data": { "database_url": "x", "DATABASE_URL": "y" }, "prefix": "", "mode": "upper",
+      "error": "collision" },
+    { "name": "verbatim rejects '=' in a key", "data": { "a=b": "x" }, "prefix": "", "mode": "verbatim",
+      "error": "value" },
+    { "name": "NUL in a value", "data": { "k": "a\u0000b" }, "prefix": "", "mode": "auto",
+      "error": "value" }
+  ],
+  "merge": [
+    { "name": "later import wins", "imports": [{ "A": "1", "B": "1" }, { "B": "2" }],
+      "expect": { "A": "1", "B": "2" }, "overridden": ["B"] },
+    { "name": "case-insensitive later import wins and keeps its own spelling", "caseInsensitive": true, "imports": [{ "db_url": "1" }, { "DB_URL": "2" }],
+      "expect": { "DB_URL": "2" }, "overridden": ["DB_URL"] }
+  ],
+  "plan": [
+    { "name": "existing variables win by default", "values": { "A": "vault", "B": "vault" }, "env": { "A": "local" }, "override": false,
+      "set": { "B": "vault" }, "kept": ["A"] },
+    { "name": "override replaces them", "values": { "A": "vault", "B": "vault" }, "env": { "A": "local" }, "override": true,
+      "set": { "A": "vault", "B": "vault" }, "kept": [] },
+    { "name": "an empty existing value still counts as set", "values": { "A": "vault" }, "env": { "A": "" }, "override": false,
+      "set": {}, "kept": ["A"] }
+  ],
+  "parseImport": [
+    { "raw": "database", "expect": { "optional": false, "kind": "relative", "path": "database", "prefix": "", "name": "auto" } },
+    { "raw": "optional:feature-flags", "expect": { "optional": true, "kind": "relative", "path": "feature-flags" } },
+    { "raw": "vault://secret/order-service/prod/db", "expect": { "kind": "absolute", "path": "secret/order-service/prod/db" } },
+    { "raw": "vault://", "expect": { "kind": "base", "path": "" } },
+    { "raw": "redis?prefix=REDIS_&name=upper&kv=1", "expect": { "path": "redis", "prefix": "REDIS_", "name": "upper", "kv": 1 } },
+    { "raw": "nested/coll/", "expect": { "path": "nested/coll" } },
+    { "raw": "x?name=snake", "error": "config" },
+    { "raw": "x?kv=3", "error": "config" },
+    { "raw": "x?color=red", "error": "config" },
+    { "raw": "x?prefix=BAD-", "error": "config" },
+    { "raw": "../etc", "error": "config" },
+    { "raw": "a//b", "error": "config" },
+    { "raw": "vault://secret", "error": "config" },
+    { "raw": "https://example.com/x", "error": "config" }
+  ]
+}
