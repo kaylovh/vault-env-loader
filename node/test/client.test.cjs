@@ -381,7 +381,7 @@ test('node --import register (ESM, top-level await)', async () => {
   try {
     const entry = path.join(tmp, 'entry.mjs');
     fs.writeFileSync(entry, PRINT_ENV);
-    const out = spawnSync(process.execPath, ['--import', REGISTER_MJS, entry], { env: childEnv(v.addr) });
+    const out = spawnSync(process.execPath, ['--import', require('url').pathToFileURL(REGISTER_MJS).href, entry], { env: childEnv(v.addr) });
     assert.equal(out.status, 0, String(out.stderr));
     assert.equal(JSON.parse(out.stdout).DB_PASSWORD, 's3cr3t');
   } finally {
