@@ -1,11 +1,15 @@
 name: python-release
 
-# Push a tag like python-v0.1.0 to publish python/ to PyPI.
-# PyPI Trusted Publishing (OIDC): no PyPI token is stored in this repository,
-# and the upload carries digital attestations. Configure it once on pypi.org —
-# for a project that does not exist yet as a "pending publisher" (Account ->
-# Publishing): project vault-env-loader, owner kaylovh, repository
+# Push a tag like python-v0.1.0 to publish python/ to PyPI and create the GitHub
+# release. PyPI Trusted Publishing (OIDC): no PyPI token is stored in this
+# repository, and the upload carries digital attestations. Configured on
+# pypi.org: publisher for project vault-env-loader, owner kaylovh, repository
 # vault-env-loader, workflow python-release.yml, environment pypi.
+#
+# The release notes are .github/release/python.md (what the package is, how to
+# use it) plus the version's section of python/CHANGELOG.md; a tag without a
+# changelog entry fails before anything is published. Files already on PyPI are
+# skipped, so re-running the tag only refreshes the release.
 on:
   push:
     tags: ['python-v*']
@@ -29,12 +33,18 @@ jobs:
           tag="${GITHUB_REF_NAME#python-v}"
           lib="$(python -c 'import vault_env_loader; print(vault_env_loader.__version__)')"
           test "$tag" = "$lib" || { echo "tag $tag, vault_env_loader.__version__ $lib"; exit 1; }
+      - name: Release notes
+        run: mkdir -p ../notes && python ../.github/release/notes.py python "${GITHUB_REF_NAME#python-v}" > ../notes/notes.md
       - run: python -m unittest discover -s tests -t tests
       - run: python -m pip install --upgrade build && python -m build
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: python/dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes
+          path: notes/notes.md
 
   publish:
     needs: build
@@ -48,3 +58,32 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: notes
+          path: notes/
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          title="vault-env-loader ${GITHUB_REF_NAME#python-v} (Python)"
+          if gh release view "$GITHUB_REF_NAME" -R "$REPO" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" -R "$REPO" --title "$title" --notes-file notes/notes.md
+            gh release upload "$GITHUB_REF_NAME" -R "$REPO" --clobber dist/*
+          else
+            gh release create "$GITHUB_REF_NAME" -R "$REPO" --verify-tag --title "$title" --notes-file notes/notes.md dist/*
+          fi

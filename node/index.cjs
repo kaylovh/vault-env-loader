@@ -20,7 +20,7 @@ const https = require('https');
 const tls = require('tls');
 const childProcess = require('child_process');
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const TAG = '[vault-env-loader]';
 const EX_CONFIG = 78;
 const LOADED_MARK = 'VAULT_ENV_LOADED';

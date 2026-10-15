@@ -1,20 +1,27 @@
 name: node-release
 
-# Push a tag like node-v0.1.0 to publish node/ to npm.
-# npm Trusted Publishing (OIDC): no npm token is stored in this repository.
-# Configure it once on npmjs.com: package settings -> Trusted Publisher ->
+# Push a tag like node-v0.1.0 to publish node/ to npm and create the GitHub
+# release. npm Trusted Publishing (OIDC): no npm token is stored in this
+# repository. Configured on npmjs.com: package settings -> Trusted Publisher ->
 # GitHub Actions, repository kaylovh/vault-env-loader, workflow node-release.yml.
+#
+# The release notes are .github/release/node.md (what the package is, how to
+# use it) plus the version's section of node/CHANGELOG.md; a tag without a
+# changelog entry fails before anything is published. A version that is already
+# on npm is not published again, so re-running the tag only refreshes the release.
 on:
   push:
     tags: ['node-v*']
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the GitHub release
+      id-token: write   # npm Trusted Publishing and provenance
     defaults:
       run:
         working-directory: node
@@ -30,5 +37,24 @@ jobs:
           pkg="$(node -p "require('./package.json').version")"
           lib="$(node -p "require('./index.cjs').VERSION")"
           test "$tag" = "$pkg" && test "$tag" = "$lib" || { echo "tag $tag, package.json $pkg, index.cjs $lib"; exit 1; }
+      - name: Release notes
+        run: python3 ../.github/release/notes.py node "${GITHUB_REF_NAME#node-v}" > "$RUNNER_TEMP/notes.md"
       - run: node --test test/spec.test.cjs test/client.test.cjs
-      - run: npm publish --provenance --access public
+      - name: Publish to npm
+        run: |
+          v="${GITHUB_REF_NAME#node-v}"
+          if [ -n "$(npm view "vault-env-loader@$v" version 2>/dev/null)" ]; then
+            echo "vault-env-loader@$v is already on npm: not publishing again."
+          else
+            npm publish --provenance --access public
+          fi
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="vault-env-loader ${GITHUB_REF_NAME#node-v} (Node.js)"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$title" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$title" --notes-file "$RUNNER_TEMP/notes.md"
+          fi

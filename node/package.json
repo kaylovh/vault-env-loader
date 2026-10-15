@@ -1,6 +1,6 @@
 {
   "name": "vault-env-loader",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Load HashiCorp Vault KV secrets into environment variables before your app starts. Zero dependencies.",
   "keywords": ["vault", "hashicorp", "secrets", "env", "environment", "dotenv", "kv", "config"],
   "license": "MIT",
