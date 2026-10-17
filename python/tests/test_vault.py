@@ -53,6 +53,32 @@ class RealVault(unittest.TestCase):
         cls.reader = t['auth']['client_token']
         _, s = api('POST', 'auth/token/create', {'policies': ['default'], 'ttl': '1h'})
         cls.stranger = s['auth']['client_token']
+        api('POST', 'sys/auth/approle', {'type': 'approle'})  # 400 if already enabled: fine
+        api('POST', 'auth/approle/role/vel', {'token_policies': ['vel-reader'], 'token_ttl': '10m', 'token_max_ttl': '30m'})
+        cls.role_id = api('GET', 'auth/approle/role/vel/role-id')[1]['data']['role_id']
+        cls.secret_id = api('POST', 'auth/approle/role/vel/secret-id', {})[1]['data']['secret_id']
+        cls.once_secret_id = api('POST', 'auth/approle/role/vel/secret-id', {'num_uses': 1})[1]['data']['secret_id']
+
+    def role_env(self, **extra):
+        # AppRole tokens carry only role_name as metadata, so relative imports need VAULT_ENV_BASE.
+        e = {'VAULT_ADDR': ADDR, 'VAULT_ROLE_ID': self.role_id, 'VAULT_SECRET_ID': self.secret_id, 'VAULT_ENV_BASE': 'secret/app/prod'}
+        e.update(extra)
+        return e
+
+    def test_approle_login(self):
+        self.assertEqual(V.fetch(env=self.role_env(VAULT_ENV_IMPORT='db'), retry_delay=0.001), {'DB_PASSWORD': 's3cr3t', 'DB_USER': 'app'})
+
+    def test_approle_single_use_secret_id(self):
+        env = lambda: self.role_env(VAULT_SECRET_ID=self.once_secret_id, VAULT_ENV_IMPORT='db')  # noqa: E731
+        self.assertEqual(V.fetch(env=env(), retry_delay=0.001)['DB_USER'], 'app')
+        with self.assertRaises(V.VaultEnvError) as cm:
+            V.fetch(env=env(), retry_delay=0.001)
+        self.assertEqual(cm.exception.code, 'auth')
+
+    def test_approle_wrong_secret_id(self):
+        with self.assertRaises(V.VaultEnvError) as cm:
+            V.fetch(env=self.role_env(VAULT_SECRET_ID='nope', VAULT_ENV_IMPORT='db'), retry_delay=0.001)
+        self.assertEqual(cm.exception.code, 'auth')
 
     def env(self, **extra):
         e = {'VAULT_ADDR': ADDR, 'VAULT_TOKEN': self.reader}

@@ -6,6 +6,7 @@ Load secrets from HashiCorp Vault's KV engine into environment variables **befor
 - **Fails fast.** If a secret cannot be loaded, your application does not start (exit code 78), instead of failing later in business code.
 - **Imports like Spring Cloud Vault.** `vault://secret/my-app/prod/database`.
 - **The token stays out of your app.** `VAULT_TOKEN` is removed from the environment your application sees.
+- **Token or AppRole.** With AppRole it logs in once per start, reads, and revokes the session before your app runs.
 - Works with HashiCorp Vault (KV v1 and v2, auto-detected) and with Vault-compatible servers.
 - Same configuration and behaviour as the [Node.js package](https://github.com/kaylovh/vault-env-loader/tree/main/node).
 
@@ -75,12 +76,15 @@ Connection settings use Vault's standard variable names, so the `vault` CLI, `hv
 | `VAULT_ADDR` | `--addr` | Vault address. Required. |
 | `VAULT_TOKEN` | — | Token. There is deliberately no `--token` flag: arguments are visible in `ps`. |
 | `VAULT_TOKEN_FILE` | `--token-file` | Read the token from a file instead. |
+| `VAULT_ROLE_ID` / `VAULT_ROLE_ID_FILE` | `--role-id-file` | [AppRole](#approle) role ID, used only when no token is set. |
+| `VAULT_SECRET_ID` / `VAULT_SECRET_ID_FILE` | `--secret-id-file` | AppRole secret ID. There is no `--secret-id` flag, for the same reason as `--token`. |
+| `VAULT_ENV_APPROLE_MOUNT` | `--approle-mount` | AppRole auth mount. Default `approle`. |
 | `VAULT_NAMESPACE` | — | Vault Enterprise namespace. |
 | `VAULT_CACERT` / `VAULT_CAPATH` | — | Extra CA certificate file / directory (every `*.pem` and `*.crt` in it). The system trust store is always used too. |
 | `VAULT_ENV_IMPORT` | `--import` | What to load, comma or newline separated (flag repeatable). Required. |
 | `VAULT_ENV_BASE` | `--base` | Base path for relative imports. |
 | `VAULT_ENV_OVERRIDE` | `--override` | `true`: replace variables that are already set. Default: keep them. |
-| `VAULT_ENV_KEEP_TOKEN` | `--keep-token` | `true`: leave `VAULT_TOKEN` in the application's environment. |
+| `VAULT_ENV_KEEP_TOKEN` | `--keep-token` | `true`: leave `VAULT_TOKEN` (or the AppRole variables) in the application's environment. |
 | `VAULT_ENV_TIMEOUT` | `--timeout` | Seconds per request. Default 10. |
 | `VAULT_ENV_RETRIES` | `--retries` | Retries for transient failures. Default 3 (1 s, 2 s, 4 s). |
 | `VAULT_ENV_ALLOW_HTTP` | — | `true` to allow plain `http://` to a host other than localhost. Prints a warning on every start. |
@@ -90,6 +94,32 @@ Connection settings use Vault's standard variable names, so the `vault` CLI, `hv
 **Proxies:** like every Python HTTP client, requests honour `HTTPS_PROXY` / `HTTP_PROXY` and `NO_PROXY`. Servers often set a global proxy for `pip`; if Vault is reachable directly, add its host to `NO_PROXY`. (The Node.js package does not use proxies.)
 
 If neither `VAULT_ADDR` nor `VAULT_ENV_IMPORT` is set, nothing is loaded and the command runs anyway — the same start command works on a laptop without Vault. Setting only some of them is an error.
+
+## AppRole
+
+When no token is configured and `VAULT_ROLE_ID` (or `VAULT_ROLE_ID_FILE`) is, vault-env-loader authenticates with [AppRole](https://developer.hashicorp.com/vault/docs/auth/approle):
+
+```bash
+VAULT_ADDR=https://vault.example.com
+VAULT_ROLE_ID=59d6d1ca-47bb-4e7e-a40b-8be3bc5a0ba8
+VAULT_SECRET_ID_FILE=/run/secrets/vault-secret-id   # or VAULT_SECRET_ID=...
+VAULT_ENV_BASE=secret/order-service/prod            # see below
+VAULT_ENV_IMPORT="database, redis?prefix=REDIS_"
+```
+
+1. `POST auth/approle/login` (or `auth/<VAULT_ENV_APPROLE_MOUNT>/login`) with the role ID and, if set, the secret ID;
+2. the imports are read with the session token it returns;
+3. `auth/token/revoke-self` revokes the session — also when a read failed. If the revoke fails, a warning is printed and the session simply expires;
+4. your command starts (on POSIX the wrapper `exec`s it, after the revoke). The session token never enters its environment, and the AppRole variables that were used are removed (unless `VAULT_ENV_KEEP_TOKEN=true`, which leaves them so the application can log in itself).
+
+Things to know:
+
+- **A token wins.** If `VAULT_TOKEN` or `VAULT_TOKEN_FILE` is set, it is used exactly as before and the AppRole variables are left untouched (a note says so).
+- **Every start uses the secret ID once**, and so does `check`. A secret ID limited to a number of uses (`secret_id_num_uses`) suits one-off jobs; a service that restarts needs an unlimited one.
+- **The policy needs** `read` on the paths, and the `default` policy (for `lookup-self` and `revoke-self`) — AppRole tokens get it unless the role sets `token_no_default_policy`.
+- **Relative imports** need a base path. AppRole tokens usually carry only `role_name` as metadata, so set `VAULT_ENV_BASE`, or write absolute `vault://` paths. A server that puts `application` and `environment` in the session's metadata gets the base from there, as with tokens.
+- **The login is not repeated once it was sent.** Connection failures before that, 429 and 503 are retried; a timeout or 5xx after the request went out is not, because Vault may already have used up a secret ID use.
+- Response wrapping (`secret_id` delivered as a wrapping token) is not supported.
 
 ## Imports
 
@@ -146,11 +176,14 @@ Nothing is started unless every non-optional import loads. The process exits wit
 | Situation | Retried? |
 |---|---|
 | 401 / 403 — invalid, expired or revoked token, or the policy does not allow the path | no |
+| AppRole login 400 / 403 — wrong, expired or used-up role ID / secret ID | no |
+| AppRole login: connection not established, 429, 503 | yes |
+| AppRole login: timeout, connection lost or 5xx after the request was sent | no |
 | 404 — path does not exist (skipped if `optional:`) | no |
 | 429, 500, 502, 503, 504, connection errors, timeouts | yes, `VAULT_ENV_RETRIES` times — except a 502 that names keys with a permanent reason (e.g. `alias 'x' could not be resolved: not_found`), which fails at once |
 | 3xx redirects | not followed (the token would go with them); fails |
 
-A token that expires within 14 days produces a warning.
+A token that expires within 14 days produces a warning (not an AppRole session: those are short-lived by design).
 
 ## Things to know
 
@@ -160,7 +193,7 @@ A token that expires within 14 days produces a warning.
 - **One value is limited to 128 KB** (the Linux limit for one environment string); larger values are refused with the key name.
 - **No `.pth` auto-loading.** Loading on every interpreter start (including `pip`) would be invisible and fragile; the wrapper already needs no code change.
 - **Windows** has no `exec`: the wrapper runs the command as a child and passes its exit code through.
-- Only token authentication for now; AppRole and Kubernetes auth may follow.
+- Token and AppRole authentication; Kubernetes auth may follow.
 
 ## Library API
 
@@ -171,12 +204,13 @@ load(env=None, **options)    # -> names set in os.environ (or in the mapping `en
 fetch(env=None, **options)   # -> {NAME: value}; does not touch the environment
 ```
 
-`options` mirror the variables above: `addr`, `token`, `token_file`, `imports`, `base`, `namespace`, `cacert`, `capath`, `override`, `keep_token`, `timeout`, `retries`, `allow_http`. `env` is the mapping configuration is read from (and, for `load()`, written to); default `os.environ`. `VaultEnvError` has a `code`: `config`, `auth`, `not_found`, `resolve`, `collision`, `value`, `unavailable`. Messages contain paths and key names, never values or tokens.
+`options` mirror the variables above: `addr`, `token`, `token_file`, `role_id`, `role_id_file`, `secret_id`, `secret_id_file`, `approle_mount`, `imports`, `base`, `namespace`, `cacert`, `capath`, `override`, `keep_token`, `timeout`, `retries`, `allow_http`. `env` is the mapping configuration is read from (and, for `load()`, written to); default `os.environ`. `VaultEnvError` has a `code`: `config`, `auth`, `not_found`, `resolve`, `collision`, `value`, `unavailable`. Messages contain paths and key names, never values or tokens.
 
 ## Security notes
 
 - Secret values are never written to logs, error messages, argv or disk. Unexpected errors print only the exception type, never a traceback.
-- Redirects are not followed, so the token is only ever sent to `VAULT_ADDR`.
+- Redirects are not followed, so the token (and the AppRole login) is only ever sent to `VAULT_ADDR`.
+- The AppRole login body is never logged; `check` shows only the first 8 characters of the role ID.
 - Requests carry `User-Agent: vault-env-loader/<version> python/<version>`, so server audit logs can tell which client read what.
 
 ## License

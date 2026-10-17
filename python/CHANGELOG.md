@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — 2026-10-17
+
+- AppRole authentication: `VAULT_ROLE_ID` / `VAULT_ROLE_ID_FILE`, `VAULT_SECRET_ID` / `VAULT_SECRET_ID_FILE`, `VAULT_ENV_APPROLE_MOUNT` (and `role_id`, `secret_id`, `approle_mount`, … as keyword options). Used only when no token is set: logs in once, reads, revokes the session with `auth/token/revoke-self`, then starts the command; the variables it used are removed from the command's environment.
+- A login is retried only when Vault cannot have processed it (request never sent, 429, 503).
+- No change when no AppRole variable is set: behaviour, output and exit codes are those of 0.1.0.
+
 ## 0.1.0 — 2026-10-15
 
 - First release, with the same configuration and behaviour as the Node.js package: wrapper command (exec on POSIX), `python -m vault_env_loader`, `load()` / `fetch()`, `check`.

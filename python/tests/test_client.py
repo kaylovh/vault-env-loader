@@ -382,5 +382,145 @@ class Processes(unittest.TestCase):
             self.assertEqual(p.returncode, 42)
 
 
+# ---------------------------------------------------------------------------
+# AppRole (0.2)
+
+ROLE = {'role_id': 'role-123', 'secret_id': 'secret-456'}
+APPROLE_ROUTES = dict(ROUTES, **{'auth/token/revoke-self': {'status': 204}})
+
+
+def role_env(addr, **extra):
+    env = {'VAULT_ADDR': addr, 'VAULT_ROLE_ID': ROLE['role_id'], 'VAULT_SECRET_ID': ROLE['secret_id'], 'VAULT_ENV_IMPORT': 'database'}
+    env.update(extra)
+    return env
+
+
+def role_child_env(addr, **extra):
+    env = child_env(addr, VAULT_ROLE_ID=ROLE['role_id'], VAULT_SECRET_ID=ROLE['secret_id'], **extra)
+    env.pop('VAULT_TOKEN', None)
+    return env
+
+
+class AppRole(unittest.TestCase):
+    def test_login_read_revoke(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, approle=ROLE) as v:
+            env = role_env(v.addr)
+            with captured_stderr() as err:
+                self.assertEqual(V.load(env=env, **FAST), ['DB_PASSWORD'])
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+            self.assertNotIn('VAULT_ROLE_ID', env)
+            self.assertNotIn('VAULT_SECRET_ID', env)
+            self.assertNotIn('expires in', err.getvalue(), 'a short session TTL is not worth a warning')
+            self.assertEqual(['%s %s' % (r['method'], r['path']) for r in v.requests], [
+                'POST auth/approle/login',
+                'GET auth/token/lookup-self',
+                'GET sys/internal/ui/mounts/secret/order-service/prod/database',
+                'GET secret/data/order-service/prod/database',
+                'POST auth/token/revoke-self',
+            ])
+            self.assertIsNone(v.requests[0]['token'])
+            self.assertEqual(v.requests[0]['body'], {'role_id': 'role-123', 'secret_id': '***'})
+            self.assertTrue(all(r['token'] == TOKEN for r in v.requests[1:]))
+
+    def test_wrong_secret_id_fails_once_without_reads(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, approle=ROLE) as v:
+            with self.assertRaises(V.VaultEnvError) as cm:
+                V.load(env=role_env(v.addr, VAULT_SECRET_ID='wrong'), **FAST)
+            self.assertEqual(cm.exception.code, 'auth')
+            self.assertEqual(v.paths(), ['auth/approle/login'])
+
+    def test_session_revoked_even_when_a_read_fails(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, approle=ROLE) as v:
+            with self.assertRaises(V.VaultEnvError) as cm:
+                V.load(env=role_env(v.addr, VAULT_ENV_IMPORT='missing'), **FAST)
+            self.assertEqual(cm.exception.code, 'not_found')
+            self.assertEqual(v.paths()[-1], 'auth/token/revoke-self')
+
+    def test_failed_revoke_only_warns(self):
+        routes = dict(APPROLE_ROUTES, **{'auth/token/revoke-self': {'status': 500, 'body': {'errors': []}}})
+        with FakeVault(routes, token=TOKEN, approle=ROLE) as v:
+            env = role_env(v.addr)
+            with captured_stderr() as err:
+                V.load(env=env, **FAST)
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+            self.assertIn('Could not revoke the AppRole session (HTTP 500); it expires by itself', err.getvalue())
+
+    def test_token_wins_and_approle_variables_are_left(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            env = base_env(v.addr, VAULT_ENV_IMPORT='database', VAULT_ROLE_ID='r', VAULT_SECRET_ID='s')
+            with captured_stderr() as err:
+                V.load(env=env, **FAST)
+            self.assertEqual((env['DB_PASSWORD'], env['VAULT_ROLE_ID'], env['VAULT_SECRET_ID']), ('s3cr3t', 'r', 's'))
+            self.assertIn('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored', err.getvalue())
+            self.assertFalse(any(p.endswith('/login') for p in v.paths()))
+
+    def test_login_retried_on_503_not_after_500_or_once_sent(self):
+        ok = {'status': 200, 'body': {'auth': {'client_token': TOKEN}}}
+        with FakeVault(dict(APPROLE_ROUTES, **{'auth/approle/login': [{'status': 503, 'body': {'errors': []}}, ok]}), token=TOKEN) as v:
+            env = role_env(v.addr)
+            V.load(env=env, **FAST)
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+        with FakeVault(dict(APPROLE_ROUTES, **{'auth/approle/login': {'status': 500, 'body': {'errors': []}}}), token=TOKEN) as v:
+            with self.assertRaises(V.VaultEnvError) as cm:
+                V.load(env=role_env(v.addr), **FAST)
+            self.assertEqual(cm.exception.code, 'unavailable')
+            self.assertEqual(len(v.requests), 1)
+        with FakeVault(dict(APPROLE_ROUTES, **{'auth/approle/login': {'hang': True}}), token=TOKEN) as v:
+            with self.assertRaises(V.VaultEnvError) as cm:
+                V.load(env=role_env(v.addr, VAULT_ENV_TIMEOUT='0.3'), **FAST)
+            self.assertEqual(cm.exception.code, 'unavailable')
+            self.assertEqual(len(v.requests), 1, 'a login the server may have processed is not repeated')
+
+    def test_refused_connection_is_retried(self):
+        import socket as _socket
+        s = _socket.socket()
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+        s.close()
+        started = time.time()
+        with self.assertRaises(V.VaultEnvError) as cm:
+            V.load(env=role_env('http://127.0.0.1:%d' % port, VAULT_ENV_RETRIES='2'), retry_delay=0.05)
+        self.assertEqual(cm.exception.code, 'unavailable')
+        self.assertGreaterEqual(time.time() - started, 0.14, 'two retries with 50 ms and 100 ms backoff')
+
+    def test_wrapper_strips_used_variables_and_keeps_the_rest(self):
+        d = tempfile.mkdtemp()
+        try:
+            f = os.path.join(d, 'unused-role-id')
+            with open(f, 'w') as fh:
+                fh.write('other')
+            with FakeVault(APPROLE_ROUTES, token=TOKEN, approle=ROLE) as v:
+                code, out, err = run([sys.executable, MODULE, '--', sys.executable, '-c',
+                                      'import json, os; print(json.dumps({k: os.environ.get(k) for k in '
+                                      '("DB_PASSWORD", "VAULT_ROLE_ID", "VAULT_SECRET_ID", "VAULT_ROLE_ID_FILE", "VAULT_TOKEN")}))'],
+                                     role_child_env(v.addr, VAULT_ROLE_ID_FILE=f))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out), {'DB_PASSWORD': 's3cr3t', 'VAULT_ROLE_ID': None, 'VAULT_SECRET_ID': None,
+                                                   'VAULT_ROLE_ID_FILE': f, 'VAULT_TOKEN': None})
+                self.assertEqual(v.paths()[-1], 'auth/token/revoke-self', 'revoked before exec')
+        finally:
+            shutil.rmtree(d)
+
+    def test_secret_id_flag_is_refused(self):
+        code, _, err = run([sys.executable, MODULE, '--secret-id', 'x', '--', 'true'], dict(os.environ))
+        self.assertEqual(code, 78)
+        self.assertIn('no --secret-id option', err)
+
+    def test_check_names_the_auth_method_and_revokes(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, approle=ROLE) as v:
+            code, out, err = run([sys.executable, MODULE, 'check'], role_child_env(v.addr))
+            self.assertEqual(code, 0, err)
+            self.assertIn('auth     approle (role_id role-123..., mount approle; session revoked after reading)', out)
+            self.assertNotIn('secret-456', out + err)
+            self.assertEqual(v.paths()[-1], 'auth/token/revoke-self')
+
+    def test_another_mount(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, approle=dict(ROLE, mount='ci/approle')) as v:
+            env = role_env(v.addr, VAULT_ENV_APPROLE_MOUNT='ci/approle')
+            V.load(env=env, **FAST)
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+            self.assertEqual(v.paths()[0], 'auth/ci/approle/login')
+
+
 if __name__ == '__main__':
     unittest.main()

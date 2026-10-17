@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 __all__ = ['load', 'fetch', 'VaultEnvError', '__version__']
 
 TAG = '[vault-env-loader]'
@@ -43,6 +43,7 @@ TRANSIENT_ALIAS_REASONS = ('timeout', 'unavailable')
 ALIAS_FAILURE = re.compile(r"^alias '(.+)' could not be resolved: ([a-z_]+)$")
 TRUTHY = ('1', 'true', 'yes', 'on')
 FALSY = ('0', 'false', 'no', 'off')
+APPROLE_MOUNT = re.compile(r'^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$')
 
 
 class VaultEnvError(Exception):
@@ -95,6 +96,11 @@ def read_config(options=None, env=None):
 
     token_file = non_empty(pick('token_file', 'VAULT_TOKEN_FILE'))
     token = options['token'] if options.get('token') is not None else non_empty(env.get('VAULT_TOKEN'))
+    role_id_file = non_empty(pick('role_id_file', 'VAULT_ROLE_ID_FILE'))
+    role_id = non_empty(options['role_id']) if options.get('role_id') is not None else non_empty(env.get('VAULT_ROLE_ID'))
+    secret_id_file = non_empty(pick('secret_id_file', 'VAULT_SECRET_ID_FILE'))
+    secret_id = non_empty(options['secret_id']) if options.get('secret_id') is not None else non_empty(env.get('VAULT_SECRET_ID'))
+    approle_given = bool(role_id or role_id_file or secret_id or secret_id_file)
 
     if not addr and not imports:
         return {'configured': False}
@@ -111,8 +117,37 @@ def read_config(options=None, env=None):
             raise VaultEnvError('Cannot read VAULT_TOKEN_FILE (%s): %s.' % (token_file, _errno_name(e)), 'config')
         if not token:
             raise VaultEnvError('VAULT_TOKEN_FILE (%s) is empty.' % token_file, 'config')
-    if not token:
+    # A token, when there is one, is used exactly as before AppRole support; AppRole
+    # variables beside it are left alone (they may be meant for another tool).
+    notes = []
+    used = []
+    auth = 'token'
+    if token or token_file:
+        if approle_given:
+            notes.append('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored.')
+    elif role_id or role_id_file:
+        auth = 'approle'
+        if role_id:
+            if options.get('role_id') is None:
+                used.append('VAULT_ROLE_ID')
+        else:
+            role_id = _read_secret_file(role_id_file, 'VAULT_ROLE_ID_FILE')
+            if options.get('role_id_file') is None:
+                used.append('VAULT_ROLE_ID_FILE')
+        if secret_id:
+            if options.get('secret_id') is None:
+                used.append('VAULT_SECRET_ID')
+        elif secret_id_file:
+            secret_id = _read_secret_file(secret_id_file, 'VAULT_SECRET_ID_FILE')
+            if options.get('secret_id_file') is None:
+                used.append('VAULT_SECRET_ID_FILE')
+    elif approle_given:
+        raise VaultEnvError('VAULT_SECRET_ID is set but VAULT_ROLE_ID is not: AppRole login needs both.', 'config')
+    if auth == 'token' and not token:
         raise VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config')
+    approle_mount = non_empty(pick('approle_mount', 'VAULT_ENV_APPROLE_MOUNT')) or 'approle'
+    if not APPROLE_MOUNT.match(approle_mount) or any(seg in ('.', '..') for seg in approle_mount.split('/')):
+        raise VaultEnvError('VAULT_ENV_APPROLE_MOUNT must be a mount path such as approle.', 'config')
 
     url = urllib.parse.urlsplit(addr)
     if url.scheme not in ('http', 'https') or not url.hostname:
@@ -142,8 +177,14 @@ def read_config(options=None, env=None):
         'configured': True,
         'addr': addr.rstrip('/'),
         'insecure_http': url.scheme == 'http' and not is_loopback(url.hostname),
-        'token': token,
-        'token_from_file': non_empty(env.get('VAULT_TOKEN')) is None and options.get('token') is None and bool(token_file),
+        'auth': auth,
+        'token': token if auth == 'token' else None,
+        'role_id': role_id if auth == 'approle' else None,
+        'secret_id': secret_id if auth == 'approle' else None,
+        'approle_mount': approle_mount,
+        'approle_vars_used': used,
+        'notes': notes,
+        'token_from_file': auth == 'token' and non_empty(env.get('VAULT_TOKEN')) is None and options.get('token') is None and bool(token_file),
         'namespace': non_empty(pick('namespace', 'VAULT_NAMESPACE')),
         'ssl_context': ssl_context(non_empty(pick('cacert', 'VAULT_CACERT')), non_empty(pick('capath', 'VAULT_CAPATH'))),
         'imports': [parse_import(i) for i in imports],
@@ -155,6 +196,17 @@ def read_config(options=None, env=None):
         'retry_delay': options['retry_delay'] if options.get('retry_delay') is not None else 1.0,
         'case_insensitive': bool(options['case_insensitive']) if options.get('case_insensitive') is not None else os.name == 'nt',
     }
+
+
+def _read_secret_file(path, name):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            v = f.read().strip()
+    except OSError as e:
+        raise VaultEnvError('Cannot read %s (%s): %s.' % (name, path, _errno_name(e)), 'config')
+    if not v:
+        raise VaultEnvError('%s (%s) is empty.' % (name, path), 'config')
+    return v
 
 
 def is_loopback(host):
@@ -260,9 +312,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class _NetworkError(Exception):
-    def __init__(self, what):
+    def __init__(self, what, sent=True):
         super(_NetworkError, self).__init__(what)
         self.what = what
+        # False when the request cannot have reached the server (urllib wraps
+        # connect and send failures in URLError); a login is retried only then.
+        self.sent = sent
 
 
 def encode_path(p):
@@ -279,15 +334,26 @@ def _opener(cfg):
 
 def http_get(cfg, api_path):
     """GET <addr>/v1/<api_path> -> (status, parsed JSON body or None). Raises _NetworkError."""
-    headers = {
-        'X-Vault-Token': cfg['token'],
+    return http_request(cfg, 'GET', api_path)
+
+
+def http_request(cfg, method, api_path, body=None, with_token=True):
+    """One request; `body` is sent as JSON. The AppRole login carries no token."""
+    headers = {}
+    if with_token:
+        headers['X-Vault-Token'] = cfg['token']
+    headers.update({
         'X-Vault-Request': 'true',
         'User-Agent': 'vault-env-loader/%s python/%s' % (__version__, '.'.join(map(str, sys.version_info[:3]))),
         'Accept': 'application/json',
-    }
+    })
     if cfg.get('namespace'):
         headers['X-Vault-Namespace'] = cfg['namespace']
-    req = urllib.request.Request('%s/v1/%s' % (cfg['addr'], api_path), headers=headers, method='GET')
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request('%s/v1/%s' % (cfg['addr'], api_path), data=data, headers=headers, method=method)
     try:
         resp = _opener(cfg).open(req, timeout=cfg['timeout'])
     except urllib.error.HTTPError as e:
@@ -297,10 +363,10 @@ def http_get(cfg, api_path):
     except urllib.error.URLError as e:
         reason = e.reason
         if isinstance(reason, socket.timeout):
-            raise _NetworkError('timed out')
+            raise _NetworkError('timed out', sent=False)
         if isinstance(reason, ssl.SSLError):
-            raise _NetworkError('failed (TLS: %s)' % (getattr(reason, 'reason', None) or 'certificate verification failed'))
-        raise _NetworkError('failed (%s)' % (_errno_name(reason) if isinstance(reason, OSError) else 'network error'))
+            raise _NetworkError('failed (TLS: %s)' % (getattr(reason, 'reason', None) or 'certificate verification failed'), sent=False)
+        raise _NetworkError('failed (%s)' % (_errno_name(reason) if isinstance(reason, OSError) else 'network error'), sent=False)
     except (OSError, ValueError, http.client.HTTPException) as e:
         raise _NetworkError('failed (%s)' % (_errno_name(e) if isinstance(e, OSError) else type(e).__name__))
     try:
@@ -370,6 +436,55 @@ def _proxy_hint(cfg):
     if proxies.get(scheme) and not urllib.request.proxy_bypass(host):
         return ' The request went through the proxy in %s_PROXY; add %s to NO_PROXY if Vault is reachable directly.' % (scheme.upper(), host)
     return ''
+
+
+# ---------------------------------------------------------------------------
+# AppRole: log in once, read, revoke the session.
+
+def approle_login(cfg):
+    """Retry a login only when Vault cannot have processed it: the request never went
+    out, or Vault said so (429, 503). After it went out, a retry could spend another use
+    of a limited secret ID and then fail as "invalid"."""
+    body = {'role_id': cfg['role_id']}
+    if cfg['secret_id']:
+        body['secret_id'] = cfg['secret_id']
+    api_path = 'auth/%s/login' % cfg['approle_mount']
+    attempt = 0
+    while True:
+        res, net_err = None, None
+        try:
+            res = http_request(cfg, 'POST', api_path, body, with_token=False)
+        except _NetworkError as e:
+            net_err = e
+        again = res[0] in (429, 503) if res is not None else not net_err.sent
+        if not again or attempt >= cfg['retries']:
+            if net_err is not None:
+                raise VaultEnvError('AppRole login to Vault %s.%s' % (net_err.what, '' if net_err.what == 'timed out' else _proxy_hint(cfg)), 'unavailable')
+            break
+        time.sleep(cfg['retry_delay'] * (2 ** attempt))
+        attempt += 1
+    status, resp = res
+    if status in (400, 401, 403):
+        raise VaultEnvError('AppRole login failed: the role ID or secret ID is invalid, expired or used up (mount %s).' % cfg['approle_mount'], 'auth')
+    if status != 200:
+        raise VaultEnvError('Vault answered HTTP %s to the AppRole login.' % status, 'unavailable')
+    auth = resp.get('auth') if isinstance(resp, dict) else None
+    token = auth.get('client_token') if isinstance(auth, dict) else None
+    if not isinstance(token, str) or not token:
+        raise VaultEnvError('Vault answered the AppRole login without a token (unexpected response).', 'unavailable')
+    cfg['token'] = token
+
+
+def revoke_session(cfg):
+    """Best effort: the session expires by itself if this fails."""
+    try:
+        status, _ = http_request(cfg, 'POST', 'auth/token/revoke-self')
+        if status not in (200, 204):
+            warn('Could not revoke the AppRole session (HTTP %s); it expires by itself.' % status)
+    except _NetworkError as e:
+        warn('Could not revoke the AppRole session (%s); it expires by itself.' % e.what)
+    finally:
+        cfg['token'] = None
 
 
 # ---------------------------------------------------------------------------
@@ -569,11 +684,22 @@ def plan(values, env, override):
 # Pipeline
 
 def collect(cfg):
-    warnings = []
+    if cfg.get('auth') != 'approle':
+        return _collect(cfg)
+    approle_login(cfg)
+    try:
+        return _collect(cfg)
+    finally:
+        revoke_session(cfg)
+
+
+def _collect(cfg):
+    warnings = list(cfg.get('notes') or [])
     if cfg['insecure_http']:
         warnings.append('VAULT_ADDR uses plain http: the token and every secret cross the network unencrypted.')
     me = lookup_self(cfg)
-    if me and not me['denied'] and 0 < me['ttl'] < TTL_WARN_SECONDS:
+    # An AppRole session is short-lived by design: its TTL is no reason to warn.
+    if cfg.get('auth') != 'approle' and me and not me['denied'] and 0 < me['ttl'] < TTL_WARN_SECONDS:
         warnings.append('The token expires in %d day(s). Issue a new one before then.' % max(1, round(me['ttl'] / 86400.0)))
     base_info = resolve_base(cfg, me)
     results = []
@@ -603,6 +729,9 @@ def apply(values, env, cfg):
         env.pop('VAULT_TOKEN', None)
         if cfg['token_from_file']:
             env.pop('VAULT_TOKEN_FILE', None)
+        # Only the AppRole variables this run actually used.
+        for name in cfg.get('approle_vars_used') or []:
+            env.pop(name, None)
     return list(p['set'])
 
 
@@ -615,8 +744,9 @@ NOT_CONFIGURED = 'VAULT_ADDR and VAULT_ENV_IMPORT are not set; nothing loaded fr
 def fetch(env=None, **options):
     """Read the configured imports and return {NAME: value} without touching the environment.
 
-    Keyword options mirror the environment variables: addr, token, token_file, imports, base,
-    namespace, cacert, capath, timeout, retries, allow_http.
+    Keyword options mirror the environment variables: addr, token, token_file, role_id,
+    role_id_file, secret_id, secret_id_file, approle_mount, imports, base, namespace, cacert,
+    capath, timeout, retries, allow_http.
     """
     cfg = read_config(options, os.environ if env is None else env)
     if not cfg['configured']:
@@ -660,10 +790,13 @@ Usage:
 Options (each also has an environment variable):
   --addr <url>          VAULT_ADDR
   --token-file <path>   VAULT_TOKEN_FILE        (the token itself only via VAULT_TOKEN)
+  --role-id-file <path> VAULT_ROLE_ID_FILE      AppRole, when no token is set (or VAULT_ROLE_ID)
+  --secret-id-file <path> VAULT_SECRET_ID_FILE  (the secret ID itself only via VAULT_SECRET_ID)
+  --approle-mount <path> VAULT_ENV_APPROLE_MOUNT default approle
   --import <spec>       VAULT_ENV_IMPORT        repeatable; comma-separated in the variable
   --base <path>         VAULT_ENV_BASE          base for relative imports
   --override            VAULT_ENV_OVERRIDE      replace variables that are already set
-  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN on to the command
+  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN (or the AppRole variables) on to the command
   --timeout <seconds>   VAULT_ENV_TIMEOUT       per request, default 10
   --retries <n>         VAULT_ENV_RETRIES       default 3
 
@@ -689,7 +822,7 @@ def parse_args(argv):
         if a == '--':
             command = argv[i + 1:]
             break
-        elif a in ('--addr', '--token-file', '--import', '--base', '--timeout', '--retries'):
+        elif a in ('--addr', '--token-file', '--role-id-file', '--secret-id-file', '--approle-mount', '--import', '--base', '--timeout', '--retries'):
             v = val()
             i += 1
             if a == '--import':
@@ -703,6 +836,9 @@ def parse_args(argv):
         elif a == '--token':
             raise VaultEnvError('There is no --token option: command-line arguments are visible to every user (ps). '
                                 'Use VAULT_TOKEN or --token-file.', 'config')
+        elif a == '--secret-id':
+            raise VaultEnvError('There is no --secret-id option: command-line arguments are visible to every user (ps). '
+                                'Use VAULT_SECRET_ID or --secret-id-file.', 'config')
         elif a == 'check' and sub is None:
             sub = 'check'
         elif a in ('--version', '-v'):
@@ -730,6 +866,8 @@ def check(opts):
     me = result['self']
     base_info = result['base_info']
     lines = ['vault-env-loader %s' % __version__, 'addr     %s' % cfg['addr']]
+    if cfg.get('auth') == 'approle':
+        lines.append('auth     approle (role_id %s..., mount %s; session revoked after reading)' % (cfg['role_id'][:8], cfg['approle_mount']))
     if me and not me['denied']:
         meta = ' '.join('%s=%s' % (k, v) for k, v in me['meta'].items())
         expiry = 'expires in %dh' % round(me['ttl'] / 3600.0) if me['ttl'] else 'no expiry'

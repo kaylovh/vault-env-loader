@@ -57,6 +57,44 @@ class Spec(unittest.TestCase):
             for k, v in c['expect'].items():
                 self.assertEqual(got[k], v, '%s: %s' % (c['raw'], k))
 
+    def test_auth_selection(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp()
+        try:
+            n = 0
+            for c in CASES['authSelection']:
+                if 'name' not in c:
+                    continue  # the section's $comment
+                env = {'VAULT_ADDR': 'https://vault.example.com', 'VAULT_ENV_IMPORT': 'db'}
+                for k, v in c['env'].items():
+                    if v.startswith('<file:') and v.endswith('>'):
+                        path = os.path.join(d, 'f%d' % n)
+                        n += 1
+                        with open(path, 'w', encoding='utf-8') as fh:
+                            fh.write(v[len('<file:'):-1])
+                        env[k] = path
+                    else:
+                        env[k] = v
+                if 'error' in c:
+                    self.assertEqual(code_of(lambda: V.read_config({}, env)), c['error'], c['name'])
+                    continue
+                cfg = V.read_config({}, env)
+                e = c['expect']
+                self.assertEqual(cfg['auth'], e['auth'], c['name'])
+                if 'roleId' in e:
+                    self.assertEqual(cfg['role_id'], e['roleId'], c['name'])
+                if 'secretId' in e:
+                    self.assertEqual(cfg['secret_id'], e['secretId'], c['name'])
+                if 'mount' in e:
+                    self.assertEqual(cfg['approle_mount'], e['mount'], c['name'])
+                if 'used' in e:
+                    self.assertEqual(cfg['approle_vars_used'], e['used'], c['name'])
+                if 'ignoredNote' in e:
+                    self.assertEqual(any('ignored' in s for s in cfg['notes']), e['ignoredNote'], c['name'])
+        finally:
+            shutil.rmtree(d)
+
 
 if __name__ == '__main__':
     unittest.main()
