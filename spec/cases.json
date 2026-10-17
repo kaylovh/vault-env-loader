@@ -62,5 +62,20 @@
     { "raw": "a//b", "error": "config" },
     { "raw": "vault://secret", "error": "config" },
     { "raw": "https://example.com/x", "error": "config" }
+  ],
+  "authSelection": [
+    { "$comment": "Every case also sets VAULT_ADDR=https://vault.example.com and VAULT_ENV_IMPORT=db. \"<file:x>\" is a temporary file containing x. used = the variables removed from the command's environment after loading." },
+    { "name": "a token alone: token authentication, as in 0.1", "env": { "VAULT_TOKEN": "t" }, "expect": { "auth": "token", "used": [], "ignoredNote": false } },
+    { "name": "a token wins over AppRole and leaves its variables alone", "env": { "VAULT_TOKEN": "t", "VAULT_ROLE_ID": "r", "VAULT_SECRET_ID": "s" }, "expect": { "auth": "token", "used": [], "ignoredNote": true } },
+    { "name": "a token file wins too", "env": { "VAULT_TOKEN_FILE": "<file:t>", "VAULT_ROLE_ID": "r" }, "expect": { "auth": "token", "used": [], "ignoredNote": true } },
+    { "name": "AppRole from variables", "env": { "VAULT_ROLE_ID": "r", "VAULT_SECRET_ID": "s" }, "expect": { "auth": "approle", "roleId": "r", "secretId": "s", "mount": "approle", "used": ["VAULT_ROLE_ID", "VAULT_SECRET_ID"], "ignoredNote": false } },
+    { "name": "AppRole from files", "env": { "VAULT_ROLE_ID_FILE": "<file:r>", "VAULT_SECRET_ID_FILE": "<file:s>" }, "expect": { "auth": "approle", "roleId": "r", "secretId": "s", "used": ["VAULT_ROLE_ID_FILE", "VAULT_SECRET_ID_FILE"] } },
+    { "name": "a variable beats its file, and the unused file variable is kept", "env": { "VAULT_ROLE_ID": "r", "VAULT_ROLE_ID_FILE": "<file:other>", "VAULT_SECRET_ID": "s" }, "expect": { "auth": "approle", "roleId": "r", "secretId": "s", "used": ["VAULT_ROLE_ID", "VAULT_SECRET_ID"] } },
+    { "name": "a role ID alone (a role without bind_secret_id)", "env": { "VAULT_ROLE_ID": "r" }, "expect": { "auth": "approle", "roleId": "r", "secretId": null, "used": ["VAULT_ROLE_ID"] } },
+    { "name": "another mount", "env": { "VAULT_ROLE_ID": "r", "VAULT_SECRET_ID": "s", "VAULT_ENV_APPROLE_MOUNT": "ci/approle" }, "expect": { "auth": "approle", "mount": "ci/approle" } },
+    { "name": "a secret ID without a role ID", "env": { "VAULT_SECRET_ID": "s" }, "error": "config" },
+    { "name": "no credentials at all", "env": {}, "error": "config" },
+    { "name": "an empty role ID file", "env": { "VAULT_ROLE_ID_FILE": "<file:>" }, "error": "config" },
+    { "name": "a mount path that is not one", "env": { "VAULT_ROLE_ID": "r", "VAULT_SECRET_ID": "s", "VAULT_ENV_APPROLE_MOUNT": "../sys" }, "error": "config" }
   ]
 }
