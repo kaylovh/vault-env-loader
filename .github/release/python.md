@@ -10,6 +10,7 @@ Load secrets from HashiCorp Vault's KV engine into environment variables **befor
 - **Fails fast**: if a secret cannot be loaded, the application does not start (exit code 78).
 - **Spring Cloud Vault style imports**: `vault://secret/my-app/prod/database`.
 - **The token stays out of your application**: `VAULT_TOKEN` is removed from the environment it sees.
+- **Token or AppRole**: with AppRole it logs in once per start, reads, and revokes the session before the application runs.
 - Works with HashiCorp Vault (KV v1 and v2, detected automatically) and Vault-compatible servers.
 
 ## Install
@@ -25,6 +26,7 @@ Configure it where you deploy:
 ```bash
 VAULT_ADDR=https://vault.example.com
 VAULT_TOKEN=hvs.xxxxx                  # or VAULT_TOKEN_FILE=/run/secrets/vault-token
+#   or AppRole: VAULT_ROLE_ID=... VAULT_SECRET_ID_FILE=/run/secrets/vault-secret-id
 VAULT_ENV_IMPORT="vault://secret/order-service/prod/database, vault://secret/order-service/prod/redis?prefix=REDIS_"
 ```
 
