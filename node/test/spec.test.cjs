@@ -61,3 +61,33 @@ test('parseImport', () => {
     for (const k of Object.keys(c.expect)) assert.deepEqual(got[k], c.expect[k], `${c.raw}: ${k}`);
   }
 });
+
+test('authSelection', () => {
+  const os = require('os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vel-spec-'));
+  let n = 0;
+  for (const c of cases.authSelection) {
+    if (!c.name) continue; // the section's $comment
+    const env = { VAULT_ADDR: 'https://vault.example.com', VAULT_ENV_IMPORT: 'db' };
+    for (const [k, v] of Object.entries(c.env)) {
+      const m = /^<file:(.*)>$/.exec(v);
+      if (m) {
+        const file = path.join(dir, `f${n++}`);
+        fs.writeFileSync(file, m[1]);
+        env[k] = file;
+      } else env[k] = v;
+    }
+    if (c.error) {
+      assert.equal(codeOf(() => I.readConfig({}, env)), c.error, c.name);
+      continue;
+    }
+    const cfg = I.readConfig({}, env);
+    const e = c.expect;
+    assert.equal(cfg.auth, e.auth, c.name);
+    if ('roleId' in e) assert.equal(cfg.roleId, e.roleId, c.name);
+    if ('secretId' in e) assert.equal(cfg.secretId === undefined ? null : cfg.secretId, e.secretId, c.name);
+    if ('mount' in e) assert.equal(cfg.approleMount, e.mount, c.name);
+    if ('used' in e) assert.deepEqual(cfg.appRoleVarsUsed, e.used, c.name);
+    if ('ignoredNote' in e) assert.equal(cfg.notes.some((s) => /ignored/.test(s)), e.ignoredNote, c.name);
+  }
+});

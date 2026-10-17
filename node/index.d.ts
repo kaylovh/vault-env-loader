@@ -4,6 +4,17 @@ export interface Options {
   /** Token. Default: VAULT_TOKEN, else the contents of tokenFile / VAULT_TOKEN_FILE. */
   token?: string;
   tokenFile?: string;
+  /**
+   * AppRole, used only when there is no token: log in with roleId (+ secretId),
+   * read, then revoke the session. Default: VAULT_ROLE_ID / VAULT_ROLE_ID_FILE,
+   * VAULT_SECRET_ID / VAULT_SECRET_ID_FILE.
+   */
+  roleId?: string;
+  roleIdFile?: string;
+  secretId?: string;
+  secretIdFile?: string;
+  /** AppRole auth mount. Default: VAULT_ENV_APPROLE_MOUNT, else "approle". */
+  approleMount?: string;
   /** Imports, e.g. ["vault://secret/app/prod/db", "redis?prefix=REDIS_"]. Default: VAULT_ENV_IMPORT. */
   imports?: string[] | string;
   /** Base path for relative imports. Default: VAULT_ENV_BASE, else token metadata application/environment. */
@@ -14,7 +25,7 @@ export interface Options {
   capath?: string;
   /** Replace variables that are already set. Default: VAULT_ENV_OVERRIDE, false. */
   override?: boolean;
-  /** Leave VAULT_TOKEN in the environment after loading. Default: false. */
+  /** Leave VAULT_TOKEN (or the AppRole variables) in the environment after loading. Default: false. */
   keepToken?: boolean;
   /** Seconds per request. Default 10. */
   timeout?: number;

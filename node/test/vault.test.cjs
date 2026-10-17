@@ -27,6 +27,9 @@ function api(method, p, body, token = ROOT) {
 
 let reader;
 let stranger;
+let roleId;
+let secretId;
+let onceSecretId;
 
 test.before(async () => {
   if (skip) return;
@@ -45,6 +48,11 @@ test.before(async () => {
   reader = t.body.auth.client_token;
   const s = await api('POST', 'auth/token/create', { policies: ['default'], ttl: '1h' });
   stranger = s.body.auth.client_token;
+  await api('POST', 'sys/auth/approle', { type: 'approle' }); // 400 if enabled: fine
+  await api('POST', 'auth/approle/role/vel', { token_policies: ['vel-reader'], token_ttl: '10m', token_max_ttl: '30m' });
+  roleId = (await api('GET', 'auth/approle/role/vel/role-id')).body.data.role_id;
+  secretId = (await api('POST', 'auth/approle/role/vel/secret-id', {})).body.data.secret_id;
+  onceSecretId = (await api('POST', 'auth/approle/role/vel/secret-id', { num_uses: 1 })).body.data.secret_id;
 });
 
 const env = (extra) => Object.assign({ VAULT_ADDR: ADDR, VAULT_TOKEN: reader }, extra);
@@ -75,4 +83,33 @@ test('CLI wrapper end to end', { skip }, () => {
   });
   assert.equal(out.status, 0, String(out.stderr));
   assert.equal(String(out.stdout), 's3cr3t|');
+});
+
+// AppRole tokens carry only role_name as metadata, so relative imports need VAULT_ENV_BASE.
+const roleEnv = (extra) => Object.assign({ VAULT_ADDR: ADDR, VAULT_ROLE_ID: roleId, VAULT_SECRET_ID: secretId, VAULT_ENV_BASE: 'secret/app/prod' }, extra);
+
+test('AppRole login against real Vault', { skip }, async () => {
+  const values = await lib.fetch({ env: roleEnv({ VAULT_ENV_IMPORT: 'db' }), retryDelayMs: 1 });
+  assert.deepEqual(values, { DB_PASSWORD: 's3cr3t', DB_USER: 'app' });
+});
+
+test('AppRole: a single-use secret ID logs in once', { skip }, async () => {
+  const env = () => roleEnv({ VAULT_SECRET_ID: onceSecretId, VAULT_ENV_IMPORT: 'db' });
+  assert.equal((await lib.fetch({ env: env(), retryDelayMs: 1 })).DB_USER, 'app');
+  await assert.rejects(lib.fetch({ env: env(), retryDelayMs: 1 }), (e) => e.code === 'auth');
+});
+
+test('AppRole: a wrong secret ID is refused', { skip }, async () => {
+  await assert.rejects(lib.fetch({ env: roleEnv({ VAULT_SECRET_ID: 'nope', VAULT_ENV_IMPORT: 'db' }), retryDelayMs: 1 }), (e) => e.code === 'auth');
+});
+
+test('AppRole: CLI wrapper end to end, credentials stripped', { skip }, () => {
+  const print = 'process.stdout.write([process.env.DB_PASSWORD, process.env.VAULT_ROLE_ID || "", process.env.VAULT_SECRET_ID || "", process.env.VAULT_TOKEN || ""].join("|"))';
+  const base = Object.assign({}, process.env);
+  delete base.VAULT_TOKEN;
+  const out = spawnSync(process.execPath, [path.join(__dirname, '..', 'index.cjs'), '--', process.execPath, '-e', print], {
+    env: Object.assign(base, roleEnv({ VAULT_ENV_IMPORT: 'db' })),
+  });
+  assert.equal(out.status, 0, String(out.stderr));
+  assert.equal(String(out.stdout), 's3cr3t|||');
 });

@@ -20,7 +20,7 @@ const https = require('https');
 const tls = require('tls');
 const childProcess = require('child_process');
 
-const VERSION = '0.1.1';
+const VERSION = '0.2.0';
 const TAG = '[vault-env-loader]';
 const EX_CONFIG = 78;
 const LOADED_MARK = 'VAULT_ENV_LOADED';
@@ -33,6 +33,7 @@ const NAME_MODES = ['auto', 'verbatim', 'upper'];
 // Some Vault-compatible servers that resolve keys from other stores answer 502
 // with "alias 'x' could not be resolved: <reason>" per failed key.
 const TRANSIENT_ALIAS_REASONS = ['timeout', 'unavailable'];
+const APPROLE_MOUNT = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 
 class VaultEnvError extends Error {
   constructor(message, code) {
@@ -78,6 +79,11 @@ function readConfig(options, env) {
 
   const tokenFile = nonEmpty(pick('tokenFile', 'VAULT_TOKEN_FILE'));
   let token = options.token !== undefined ? options.token : nonEmpty(env.VAULT_TOKEN);
+  const roleIdFile = nonEmpty(pick('roleIdFile', 'VAULT_ROLE_ID_FILE'));
+  let roleId = options.roleId !== undefined ? nonEmpty(options.roleId) : nonEmpty(env.VAULT_ROLE_ID);
+  const secretIdFile = nonEmpty(pick('secretIdFile', 'VAULT_SECRET_ID_FILE'));
+  let secretId = options.secretId !== undefined ? nonEmpty(options.secretId) : nonEmpty(env.VAULT_SECRET_ID);
+  const appRoleGiven = Boolean(roleId || roleIdFile || secretId || secretIdFile);
 
   const configured = Boolean(addr || imports.length);
   if (!configured) return { configured: false };
@@ -92,7 +98,33 @@ function readConfig(options, env) {
     }
     if (!token) throw new VaultEnvError(`VAULT_TOKEN_FILE (${tokenFile}) is empty.`, 'config');
   }
-  if (!token) throw new VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config');
+  // A token, when there is one, is used exactly as before AppRole support; AppRole
+  // variables beside it are left alone (they may be meant for another tool).
+  const notes = [];
+  const used = [];
+  let auth = 'token';
+  if (token || tokenFile) {
+    if (appRoleGiven) notes.push('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored.');
+  } else if (roleId || roleIdFile) {
+    auth = 'approle';
+    if (roleId) {
+      if (options.roleId === undefined) used.push('VAULT_ROLE_ID');
+    } else {
+      roleId = readSecretFile(roleIdFile, 'VAULT_ROLE_ID_FILE');
+      if (options.roleIdFile === undefined) used.push('VAULT_ROLE_ID_FILE');
+    }
+    if (secretId) {
+      if (options.secretId === undefined) used.push('VAULT_SECRET_ID');
+    } else if (secretIdFile) {
+      secretId = readSecretFile(secretIdFile, 'VAULT_SECRET_ID_FILE');
+      if (options.secretIdFile === undefined) used.push('VAULT_SECRET_ID_FILE');
+    }
+  } else if (appRoleGiven) {
+    throw new VaultEnvError('VAULT_SECRET_ID is set but VAULT_ROLE_ID is not: AppRole login needs both.', 'config');
+  }
+  if (auth === 'token' && !token) throw new VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config');
+  const approleMount = nonEmpty(pick('approleMount', 'VAULT_ENV_APPROLE_MOUNT')) || 'approle';
+  if (!APPROLE_MOUNT.test(approleMount) || approleMount.split('/').some((seg) => seg === '.' || seg === '..')) throw new VaultEnvError('VAULT_ENV_APPROLE_MOUNT must be a mount path such as approle.', 'config');
 
   let url;
   try {
@@ -117,8 +149,14 @@ function readConfig(options, env) {
     configured: true,
     addr: url.toString().replace(/\/+$/, ''),
     insecureHttp: url.protocol === 'http:' && !isLoopback(url.hostname),
-    token,
-    tokenFromFile: !nonEmpty(env.VAULT_TOKEN) && options.token === undefined && Boolean(tokenFile),
+    auth,
+    token: auth === 'token' ? token : null,
+    roleId: auth === 'approle' ? roleId : undefined,
+    secretId: auth === 'approle' ? secretId : undefined,
+    approleMount,
+    appRoleVarsUsed: used,
+    notes,
+    tokenFromFile: auth === 'token' && !nonEmpty(env.VAULT_TOKEN) && options.token === undefined && Boolean(tokenFile),
     namespace: nonEmpty(pick('namespace', 'VAULT_NAMESPACE')),
     ca: loadCa(nonEmpty(pick('cacert', 'VAULT_CACERT')), nonEmpty(pick('capath', 'VAULT_CAPATH'))),
     imports: imports.map(parseImport),
@@ -130,6 +168,17 @@ function readConfig(options, env) {
     retryDelayMs: options.retryDelayMs !== undefined ? options.retryDelayMs : 1000,
     caseInsensitive: options.caseInsensitive !== undefined ? Boolean(options.caseInsensitive) : process.platform === 'win32',
   };
+}
+
+function readSecretFile(file, name) {
+  let v;
+  try {
+    v = fs.readFileSync(file, 'utf8').trim();
+  } catch (e) {
+    throw new VaultEnvError(`Cannot read ${name} (${file}): ${e.code || 'error'}.`, 'config');
+  }
+  if (!v) throw new VaultEnvError(`${name} (${file}) is empty.`, 'config');
+  return v;
 }
 
 function isLoopback(host) {
@@ -233,17 +282,32 @@ function encodePath(p) {
 }
 
 function httpGet(cfg, apiPath) {
+  return httpRequest(cfg, 'GET', apiPath);
+}
+
+// One request. `body` is sent as JSON; the login request carries no token.
+// A rejection says whether the connection was ever established (`connected`),
+// so a login is only retried when the server cannot have seen it.
+function httpRequest(cfg, method, apiPath, body, opts) {
   const url = new URL(`${cfg.addr}/v1/${apiPath}`);
   const lib = url.protocol === 'https:' ? https : http;
-  const headers = {
-    'X-Vault-Token': cfg.token,
+  const headers = {};
+  if (!(opts && opts.noToken)) headers['X-Vault-Token'] = cfg.token;
+  Object.assign(headers, {
     'X-Vault-Request': 'true',
     'User-Agent': `vault-env-loader/${VERSION} node/${process.versions.node}`,
     Accept: 'application/json',
-  };
+  });
   if (cfg.namespace) headers['X-Vault-Namespace'] = cfg.namespace;
+  const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), 'utf8');
+  if (payload) {
+    headers['Content-Type'] = 'application/json';
+    headers['Content-Length'] = String(payload.length);
+  }
+  let connected = false;
   return new Promise((resolve, reject) => {
-    const req = lib.request(url, { method: 'GET', headers, ca: cfg.ca, agent: false }, (res) => {
+    const fail = (e) => reject(Object.assign(e, { connected }));
+    const req = lib.request(url, { method, headers, ca: cfg.ca, agent: false }, (res) => {
       const chunks = [];
       let size = 0;
       res.on('data', (c) => {
@@ -264,11 +328,15 @@ function httpGet(cfg, apiPath) {
         }
         resolve({ status: res.statusCode, body });
       });
-      res.on('error', reject);
+      res.on('error', fail);
+    });
+    req.on('socket', (sock) => {
+      if (!sock.connecting) connected = true;
+      else sock.once('connect', () => (connected = true));
     });
     req.setTimeout(cfg.timeoutMs, () => req.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
-    req.on('error', reject);
-    req.end();
+    req.on('error', fail);
+    req.end(payload);
   });
 }
 
@@ -315,6 +383,58 @@ async function getWithRetry(cfg, apiPath) {
     }
     await sleep(cfg.retryDelayMs * Math.pow(2, attempt));
     attempt += 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AppRole: log in once, read, revoke the session.
+
+// Retry a login only when Vault cannot have processed it: the connection never
+// came up, or Vault said so (429, 503). After the request went out, a retry
+// could spend another use of a limited secret ID and then fail as "invalid".
+async function appRoleLogin(cfg) {
+  const body = { role_id: cfg.roleId };
+  if (cfg.secretId) body.secret_id = cfg.secretId;
+  const apiPath = `auth/${cfg.approleMount}/login`;
+  let attempt = 0;
+  let res;
+  for (;;) {
+    let netErr;
+    res = undefined;
+    try {
+      res = await httpRequest(cfg, 'POST', apiPath, body, { noToken: true });
+    } catch (e) {
+      netErr = e;
+    }
+    const again = res ? [429, 503].includes(res.status) : !netErr.connected;
+    if (!again || attempt >= cfg.retries) {
+      if (netErr) {
+        const what = netErr.code === 'ETIMEDOUT' ? 'timed out' : `failed (${netErr.code || 'network error'})`;
+        throw new VaultEnvError(`AppRole login to Vault ${what}.`, 'unavailable');
+      }
+      break;
+    }
+    await sleep(cfg.retryDelayMs * Math.pow(2, attempt));
+    attempt += 1;
+  }
+  if (res.status === 400 || res.status === 401 || res.status === 403) {
+    throw new VaultEnvError(`AppRole login failed: the role ID or secret ID is invalid, expired or used up (mount ${cfg.approleMount}).`, 'auth');
+  }
+  if (res.status !== 200) throw new VaultEnvError(`Vault answered HTTP ${res.status} to the AppRole login.`, 'unavailable');
+  const token = res.body && res.body.auth && res.body.auth.client_token;
+  if (typeof token !== 'string' || !token) throw new VaultEnvError('Vault answered the AppRole login without a token (unexpected response).', 'unavailable');
+  cfg.token = token;
+}
+
+// Best effort: the session expires by itself if this fails.
+async function revokeSession(cfg) {
+  try {
+    const res = await httpRequest(cfg, 'POST', 'auth/token/revoke-self');
+    if (res.status !== 204 && res.status !== 200) warn(`Could not revoke the AppRole session (HTTP ${res.status}); it expires by itself.`);
+  } catch (e) {
+    warn(`Could not revoke the AppRole session (${e.code || 'network error'}); it expires by itself.`);
+  } finally {
+    cfg.token = null;
   }
 }
 
@@ -488,10 +608,21 @@ function plan(values, env, override) {
 // Pipeline
 
 async function collect(cfg) {
-  const warnings = [];
+  if (cfg.auth !== 'approle') return collectWith(cfg);
+  await appRoleLogin(cfg);
+  try {
+    return await collectWith(cfg);
+  } finally {
+    await revokeSession(cfg);
+  }
+}
+
+async function collectWith(cfg) {
+  const warnings = (cfg.notes || []).slice();
   if (cfg.insecureHttp) warnings.push('VAULT_ADDR uses plain http: the token and every secret cross the network unencrypted.');
   const self = await lookupSelf(cfg);
-  if (self && !self.denied && self.ttl > 0 && self.ttl < TTL_WARN_SECONDS) {
+  // An AppRole session is short-lived by design: its TTL is no reason to warn.
+  if (cfg.auth !== 'approle' && self && !self.denied && self.ttl > 0 && self.ttl < TTL_WARN_SECONDS) {
     warnings.push(`The token expires in ${Math.max(1, Math.round(self.ttl / 86400))} day(s). Issue a new one before then.`);
   }
   const baseInfo = resolveBase(cfg, self);
@@ -534,6 +665,8 @@ function apply(values, env, cfg) {
   if (!cfg.keepToken) {
     delete env.VAULT_TOKEN;
     if (cfg.tokenFromFile) delete env.VAULT_TOKEN_FILE;
+    // Only the AppRole variables this run actually used.
+    for (const name of cfg.appRoleVarsUsed || []) delete env[name];
   }
   return Object.keys(set);
 }
@@ -603,11 +736,15 @@ function loadSync(options) {
 
 function serializableOptions(options, cfg) {
   const o = {};
-  for (const k of ['addr', 'imports', 'base', 'tokenFile', 'namespace', 'cacert', 'capath', 'timeout', 'retries', 'retryDelayMs', 'caseInsensitive', 'allowHttp']) {
+  for (const k of ['addr', 'imports', 'base', 'tokenFile', 'namespace', 'cacert', 'capath', 'timeout', 'retries', 'retryDelayMs', 'caseInsensitive', 'allowHttp', 'approleMount']) {
     if (options && options[k] !== undefined) o[k] = options[k];
   }
-  // The token travels in the child's environment, never in argv.
-  o.token = cfg.token;
+  // Credentials travel in the child's environment, never in argv. With AppRole
+  // the child logs in and revokes; the session token never comes back.
+  if (cfg.auth === 'approle') {
+    o.roleId = cfg.roleId;
+    if (cfg.secretId) o.secretId = cfg.secretId;
+  } else o.token = cfg.token;
   return o;
 }
 
@@ -639,10 +776,13 @@ Usage:
 Options (each also has an environment variable):
   --addr <url>          VAULT_ADDR
   --token-file <path>   VAULT_TOKEN_FILE        (the token itself only via VAULT_TOKEN)
+  --role-id-file <path> VAULT_ROLE_ID_FILE      AppRole, when no token is set (or VAULT_ROLE_ID)
+  --secret-id-file <path> VAULT_SECRET_ID_FILE  (the secret ID itself only via VAULT_SECRET_ID)
+  --approle-mount <path> VAULT_ENV_APPROLE_MOUNT default approle
   --import <spec>       VAULT_ENV_IMPORT        repeatable; comma-separated in the variable
   --base <path>         VAULT_ENV_BASE          base for relative imports
   --override            VAULT_ENV_OVERRIDE      replace variables that are already set
-  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN on to the command
+  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN (or the AppRole variables) on to the command
   --timeout <seconds>   VAULT_ENV_TIMEOUT       per request, default 10
   --retries <n>         VAULT_ENV_RETRIES       default 3
 
@@ -666,6 +806,9 @@ function parseArgs(argv) {
       break;
     } else if (a === '--addr') opts.addr = val();
     else if (a === '--token-file') opts.tokenFile = val();
+    else if (a === '--role-id-file') opts.roleIdFile = val();
+    else if (a === '--secret-id-file') opts.secretIdFile = val();
+    else if (a === '--approle-mount') opts.approleMount = val();
     else if (a === '--import') imports.push(...splitList(val()));
     else if (a === '--base') opts.base = val();
     else if (a === '--override') opts.override = true;
@@ -673,6 +816,7 @@ function parseArgs(argv) {
     else if (a === '--timeout') opts.timeout = val();
     else if (a === '--retries') opts.retries = val();
     else if (a === '--token') throw new VaultEnvError('There is no --token option: command-line arguments are visible to every user (ps). Use VAULT_TOKEN or --token-file.', 'config');
+    else if (a === '--secret-id') throw new VaultEnvError('There is no --secret-id option: command-line arguments are visible to every user (ps). Use VAULT_SECRET_ID or --secret-id-file.', 'config');
     else if (a === 'check' && sub === null) sub = 'check';
     else if (a === '--version' || a === '-v') sub = 'version';
     else if (a === '--help' || a === '-h') sub = 'help';
@@ -697,6 +841,7 @@ async function check(opts) {
   const lines = [];
   lines.push(`vault-env-loader ${VERSION}`);
   lines.push(`addr     ${cfg.addr}`);
+  if (cfg.auth === 'approle') lines.push(`auth     approle (role_id ${String(cfg.roleId).slice(0, 8)}..., mount ${cfg.approleMount}; session revoked after reading)`);
   if (r.token) {
     const meta = Object.keys(r.token.meta).map((k) => `${k}=${r.token.meta[k]}`).join(' ');
     lines.push(`token    ${r.token.ttl ? `expires in ${Math.round(r.token.ttl / 3600)}h` : 'no expiry'}${meta ? `, ${meta}` : ''}`);

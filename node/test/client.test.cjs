@@ -472,3 +472,185 @@ test('SIGTERM is forwarded to the wrapped command', { skip: process.platform ===
     v.stop();
   }
 });
+
+// ---------------------------------------------------------------------------
+// AppRole (0.2)
+
+const ROLE = { role_id: 'role-123', secret_id: 'secret-456' };
+const APPROLE_ROUTES = Object.assign({ 'auth/token/revoke-self': { status: 204 } }, ROUTES);
+
+function roleEnv(addr, extra) {
+  const env = childEnv(addr, Object.assign({ VAULT_ROLE_ID: ROLE.role_id, VAULT_SECRET_ID: ROLE.secret_id }, extra));
+  delete env.VAULT_TOKEN;
+  return env;
+}
+
+test('AppRole: log in, read with the session, revoke it', async () => {
+  const v = await fake(APPROLE_ROUTES, { approle: ROLE });
+  try {
+    const env = roleEnv(v.addr);
+    const { value, stderr } = await captureStderr(() => lib.load(Object.assign({ env }, FAST)));
+    assert.deepEqual(value, ['DB_PASSWORD']);
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.equal(env.VAULT_ROLE_ID, undefined);
+    assert.equal(env.VAULT_SECRET_ID, undefined);
+    assert.ok(!/expires in/.test(stderr), 'a short session TTL is not worth a warning');
+    const reqs = await v.requests();
+    assert.deepEqual(reqs.map((r) => `${r.method} ${r.path}`), [
+      'POST auth/approle/login',
+      'GET auth/token/lookup-self',
+      'GET sys/internal/ui/mounts/secret/order-service/prod/database',
+      'GET secret/data/order-service/prod/database',
+      'POST auth/token/revoke-self',
+    ]);
+    assert.equal(reqs[0].token, null);
+    assert.deepEqual(reqs[0].body, { role_id: 'role-123', secret_id: '***' });
+    assert.ok(reqs.slice(1).every((r) => r.token === TOKEN));
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: a wrong secret ID fails once, with no read', async () => {
+  const v = await fake(APPROLE_ROUTES, { approle: ROLE });
+  try {
+    await rejectsCode(lib.load(Object.assign({ env: roleEnv(v.addr, { VAULT_SECRET_ID: 'wrong' }) }, FAST)), 'auth');
+    assert.deepEqual((await v.requests()).map((r) => r.path), ['auth/approle/login']);
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: the session is revoked even when a read fails', async () => {
+  const v = await fake(APPROLE_ROUTES, { approle: ROLE });
+  try {
+    await rejectsCode(lib.load(Object.assign({ env: roleEnv(v.addr, { VAULT_ENV_IMPORT: 'missing' }) }, FAST)), 'not_found');
+    assert.equal((await v.requests()).pop().path, 'auth/token/revoke-self');
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: a failed revoke only warns', async () => {
+  const v = await fake(Object.assign({}, APPROLE_ROUTES, { 'auth/token/revoke-self': { status: 500, body: { errors: [] } } }), { approle: ROLE });
+  try {
+    const env = roleEnv(v.addr);
+    const { stderr } = await captureStderr(() => lib.load(Object.assign({ env }, FAST)));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.match(stderr, /Could not revoke the AppRole session \(HTTP 500\); it expires by itself/);
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: a token wins; AppRole variables are left for whoever set them', async () => {
+  const v = await fake(ROUTES);
+  try {
+    const env = childEnv(v.addr, { VAULT_ROLE_ID: 'r', VAULT_SECRET_ID: 's' });
+    const { stderr } = await captureStderr(() => lib.load(Object.assign({ env }, FAST)));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.equal(env.VAULT_ROLE_ID, 'r');
+    assert.equal(env.VAULT_SECRET_ID, 's');
+    assert.match(stderr, /VAULT_TOKEN is set, so VAULT_ROLE_ID \/ VAULT_SECRET_ID are ignored/);
+    assert.ok(!(await v.requests()).some((r) => r.path.endsWith('/login')));
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: login retried on 503, not after a 500 or once the request went out', async () => {
+  const v = await fake(Object.assign({}, APPROLE_ROUTES, { 'auth/approle/login': [{ status: 503, body: { errors: [] } }, { status: 200, body: { auth: { client_token: TOKEN } } }] }));
+  try {
+    const env = roleEnv(v.addr);
+    await lib.load(Object.assign({ env }, FAST));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+  } finally {
+    v.stop();
+  }
+  const v500 = await fake(Object.assign({}, APPROLE_ROUTES, { 'auth/approle/login': { status: 500, body: { errors: [] } } }));
+  try {
+    await rejectsCode(lib.load(Object.assign({ env: roleEnv(v500.addr) }, FAST)), 'unavailable');
+    assert.equal((await v500.requests()).length, 1);
+  } finally {
+    v500.stop();
+  }
+  const hang = await fake(Object.assign({}, APPROLE_ROUTES, { 'auth/approle/login': { hang: true } }));
+  try {
+    await rejectsCode(lib.load(Object.assign({ env: roleEnv(hang.addr, { VAULT_ENV_TIMEOUT: '0.3' }) }, FAST)), 'unavailable');
+    assert.equal((await hang.requests()).length, 1, 'a login the server may have processed is not repeated');
+  } finally {
+    hang.stop();
+  }
+});
+
+test('AppRole: a refused connection is retried (the server never saw it)', async () => {
+  const net = require('net');
+  const port = await new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+  });
+  const started = Date.now();
+  await rejectsCode(lib.load({ env: roleEnv(`http://127.0.0.1:${port}`, { VAULT_ENV_RETRIES: '2' }), retryDelayMs: 50 }), 'unavailable');
+  assert.ok(Date.now() - started >= 140, 'two retries with 50 ms and 100 ms backoff');
+});
+
+test('AppRole: CLI wrapper strips the AppRole variables it used and keeps the rest', async () => {
+  const v = await fake(APPROLE_ROUTES, { approle: ROLE });
+  try {
+    const file = path.join(tmp, 'unused-role-id');
+    fs.writeFileSync(file, 'other');
+    const print = 'process.stdout.write(JSON.stringify({ DB_PASSWORD: process.env.DB_PASSWORD, R: process.env.VAULT_ROLE_ID || null, S: process.env.VAULT_SECRET_ID || null, RF: process.env.VAULT_ROLE_ID_FILE || null, T: process.env.VAULT_TOKEN || null }))';
+    const out = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', print], { env: roleEnv(v.addr, { VAULT_ROLE_ID_FILE: file }) });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.deepEqual(JSON.parse(out.stdout), { DB_PASSWORD: 's3cr3t', R: null, S: null, RF: file, T: null });
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: --secret-id is refused on the command line', () => {
+  const out = spawnSync(process.execPath, [INDEX, '--secret-id', 'x', '--', 'true'], { env: {} });
+  assert.equal(out.status, 78);
+  assert.match(String(out.stderr), /no --secret-id option/);
+});
+
+test('AppRole: loadSync() logs in inside the worker; the session never reaches the parent', async () => {
+  const v = await fake(APPROLE_ROUTES, { approle: ROLE });
+  try {
+    const print = 'process.stdout.write(JSON.stringify({ DB_PASSWORD: process.env.DB_PASSWORD, T: process.env.VAULT_TOKEN || null, S: process.env.VAULT_SECRET_ID || null }))';
+    const out = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(INDEX)}).loadSync(); ${print}`], { env: roleEnv(v.addr) });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.deepEqual(JSON.parse(out.stdout), { DB_PASSWORD: 's3cr3t', T: null, S: null });
+    assert.equal((await v.requests()).pop().path, 'auth/token/revoke-self');
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: check names the auth method and revokes its session', async () => {
+  const v = await fake(APPROLE_ROUTES, { approle: ROLE });
+  try {
+    const out = spawnSync(process.execPath, [INDEX, 'check'], { env: roleEnv(v.addr) });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.match(String(out.stdout), /auth\s+approle \(role_id role-123\.\.\., mount approle; session revoked after reading\)/);
+    assert.ok(!String(out.stdout).includes('secret-456'));
+    assert.equal((await v.requests()).pop().path, 'auth/token/revoke-self');
+  } finally {
+    v.stop();
+  }
+});
+
+test('AppRole: another mount', async () => {
+  const v = await fake(APPROLE_ROUTES, { approle: Object.assign({ mount: 'ci/approle' }, ROLE) });
+  try {
+    const env = roleEnv(v.addr, { VAULT_ENV_APPROLE_MOUNT: 'ci/approle' });
+    await lib.load(Object.assign({ env }, FAST));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.equal((await v.requests())[0].path, 'auth/ci/approle/login');
+  } finally {
+    v.stop();
+  }
+});
