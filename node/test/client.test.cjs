@@ -331,6 +331,7 @@ function childEnv(addr, extra) {
   const env = Object.assign({}, process.env, { VAULT_ADDR: addr, VAULT_TOKEN: TOKEN, VAULT_ENV_IMPORT: 'database' }, extra);
   delete env.NODE_TEST_CONTEXT;
   delete env.DB_PASSWORD;
+  if (!extra || !('VAULT_ENV_ENABLED' in extra)) delete env.VAULT_ENV_ENABLED;
   return env;
 }
 
@@ -653,4 +654,151 @@ test('AppRole: another mount', async () => {
   } finally {
     v.stop();
   }
+});
+
+// ---------------------------------------------------------------------------
+// VAULT_ENV_ENABLED
+
+const LINE = (m) => `[vault-env-loader] ${m}\n`;
+const OFF = 'VAULT_ENV_ENABLED is off; nothing loaded from Vault.';
+const ON_UNCONFIGURED = 'VAULT_ENV_ENABLED is on, but VAULT_ADDR and VAULT_ENV_IMPORT are not set.';
+const BAD_SWITCH = 'VAULT_ENV_ENABLED must be true or false (or 1/0, yes/no, on/off).';
+
+function unconfiguredEnv(extra) {
+  const env = Object.assign({}, process.env);
+  for (const k of Object.keys(env)) if (k.startsWith('VAULT_')) delete env[k];
+  delete env.NODE_TEST_CONTEXT;
+  return Object.assign(env, extra);
+}
+
+test('switched off: load() reads nothing, removes the token, does not mark the environment loaded', async () => {
+  const v = await fake(ROUTES);
+  try {
+    const env = baseEnv(v.addr, { VAULT_ENV_IMPORT: 'database', VAULT_ENV_ENABLED: 'false' });
+    const { value, stderr } = await captureStderr(() => lib.load(Object.assign({ env }, FAST)));
+    assert.deepEqual(value, []);
+    assert.equal(stderr, LINE(OFF));
+    assert.equal(env.VAULT_TOKEN, undefined);
+    assert.equal(env.VAULT_ENV_LOADED, undefined);
+    assert.equal(env.VAULT_ADDR, v.addr, 'only credentials are removed');
+    assert.deepEqual(await v.requests(), []);
+  } finally {
+    v.stop();
+  }
+});
+
+test('switched off: fetch() returns nothing and leaves the environment alone', async () => {
+  const env = { VAULT_ADDR: 'https://vault.example.com', VAULT_TOKEN: 't', VAULT_ENV_IMPORT: 'db', VAULT_ENV_ENABLED: 'off' };
+  const { value, stderr } = await captureStderr(() => lib.fetch({ env }));
+  assert.deepEqual(value, {});
+  assert.equal(stderr, LINE(OFF));
+  assert.equal(env.VAULT_TOKEN, 't');
+});
+
+test('switched off: loadSync(), -r and --import run the application without a fetch process or a request', async () => {
+  const v = await fake(ROUTES);
+  try {
+    const entry = path.join(tmp, 'entry-off.mjs');
+    fs.writeFileSync(entry, PRINT_ENV);
+    const runs = [
+      ['-e', `require(${JSON.stringify(INDEX)}).loadSync(); ${PRINT_ENV}`],
+      ['-r', REGISTER_CJS, '-e', PRINT_ENV],
+      ['--import', require('url').pathToFileURL(REGISTER_MJS).href, entry],
+    ];
+    for (const args of runs) {
+      const out = spawnSync(process.execPath, args, { env: childEnv(v.addr, { VAULT_ENV_ENABLED: '0' }) });
+      assert.equal(out.status, 0, String(out.stderr));
+      assert.deepEqual(JSON.parse(out.stdout), { VAULT_TOKEN: null, LOADED: null }, args[0]);
+      assert.equal(String(out.stderr), LINE(OFF), args[0]);
+    }
+    assert.deepEqual(await v.requests(), []);
+  } finally {
+    v.stop();
+  }
+});
+
+test('switched off: the CLI runs the command without the token and passes its exit code through', async () => {
+  const v = await fake(ROUTES);
+  try {
+    const out = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', `${PRINT_ENV}; process.exit(3)`], { env: childEnv(v.addr, { VAULT_ENV_ENABLED: 'No' }) });
+    assert.equal(out.status, 3, String(out.stderr));
+    assert.deepEqual(JSON.parse(out.stdout), { VAULT_TOKEN: null, LOADED: null });
+    assert.equal(String(out.stderr), LINE(OFF));
+    assert.deepEqual(await v.requests(), []);
+  } finally {
+    v.stop();
+  }
+});
+
+test('switched off: VAULT_ENV_KEEP_TOKEN keeps the credentials; AppRole variables are removed like after a load', () => {
+  const kept = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', PRINT_ENV], {
+    env: unconfiguredEnv({ VAULT_ENV_ENABLED: 'false', VAULT_TOKEN: TOKEN, VAULT_ENV_KEEP_TOKEN: 'true' }),
+  });
+  assert.equal(kept.status, 0, String(kept.stderr));
+  assert.equal(JSON.parse(kept.stdout).VAULT_TOKEN, TOKEN);
+  const print = 'process.stdout.write(JSON.stringify([process.env.VAULT_ROLE_ID || null, process.env.VAULT_SECRET_ID_FILE || null, process.env.VAULT_ADDR || null]))';
+  const role = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', print], {
+    env: unconfiguredEnv({ VAULT_ENV_ENABLED: 'false', VAULT_ADDR: 'https://vault.example.com', VAULT_ROLE_ID: 'r', VAULT_SECRET_ID_FILE: '/nonexistent/secret-id' }),
+  });
+  assert.equal(role.status, 0, String(role.stderr));
+  assert.deepEqual(JSON.parse(role.stdout), [null, null, 'https://vault.example.com']);
+});
+
+test('switched off: check says so, exit 0, no request', async () => {
+  const v = await fake(ROUTES);
+  try {
+    const out = spawnSync(process.execPath, [INDEX, 'check'], { env: childEnv(v.addr, { VAULT_ENV_ENABLED: 'false' }) });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.equal(String(out.stdout), `${OFF}\n`);
+    assert.equal(String(out.stderr), '');
+    assert.deepEqual(await v.requests(), []);
+  } finally {
+    v.stop();
+  }
+});
+
+test('switched on: loads as usual when configured, exit 78 when not', async () => {
+  const v = await fake(ROUTES);
+  try {
+    const out = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', PRINT_ENV], { env: childEnv(v.addr, { VAULT_ENV_ENABLED: 'true' }) });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.deepEqual(JSON.parse(out.stdout), { DB_PASSWORD: 's3cr3t', VAULT_TOKEN: null, LOADED: '1' });
+  } finally {
+    v.stop();
+  }
+  for (const args of [['--', process.execPath, '-e', 'console.log("app ran")'], ['check']]) {
+    const out = spawnSync(process.execPath, [INDEX, ...args], { env: unconfiguredEnv({ VAULT_ENV_ENABLED: 'on', VAULT_TOKEN: TOKEN }) });
+    assert.equal(out.status, 78, args[0]);
+    assert.equal(String(out.stdout), '');
+    assert.equal(String(out.stderr), LINE(ON_UNCONFIGURED));
+  }
+  const reg = spawnSync(process.execPath, ['-r', REGISTER_CJS, '-e', 'console.log("app ran")'], { env: unconfiguredEnv({ VAULT_ENV_ENABLED: 'yes' }) });
+  assert.equal(reg.status, 78);
+  assert.equal(String(reg.stdout), '');
+  assert.equal(String(reg.stderr), LINE(ON_UNCONFIGURED));
+  await rejectsCode(lib.load({ env: { VAULT_ENV_ENABLED: '1' } }), 'config');
+});
+
+test('a value that is neither on nor off fails with exit 78 and reads nothing', async () => {
+  const v = await fake(ROUTES);
+  try {
+    for (const args of [['--', process.execPath, '-e', 'console.log("app ran")'], ['check']]) {
+      const out = spawnSync(process.execPath, [INDEX, ...args], { env: childEnv(v.addr, { VAULT_ENV_ENABLED: 'ture' }) });
+      assert.equal(out.status, 78, args[0]);
+      assert.equal(String(out.stdout), '');
+      assert.equal(String(out.stderr), LINE(BAD_SWITCH));
+    }
+    assert.deepEqual(await v.requests(), []);
+  } finally {
+    v.stop();
+  }
+});
+
+test('VAULT_SKIP_VERIFY is refused even when switched off', () => {
+  const out = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', 'console.log("app ran")'], {
+    env: unconfiguredEnv({ VAULT_ENV_ENABLED: 'false', VAULT_SKIP_VERIFY: 'true' }),
+  });
+  assert.equal(out.status, 78);
+  assert.equal(String(out.stdout), '');
+  assert.match(String(out.stderr), /VAULT_SKIP_VERIFY is set/);
 });

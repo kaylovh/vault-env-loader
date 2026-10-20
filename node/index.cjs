@@ -20,7 +20,7 @@ const https = require('https');
 const tls = require('tls');
 const childProcess = require('child_process');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const TAG = '[vault-env-loader]';
 const EX_CONFIG = 78;
 const LOADED_MARK = 'VAULT_ENV_LOADED';
@@ -34,6 +34,8 @@ const NAME_MODES = ['auto', 'verbatim', 'upper'];
 // with "alias 'x' could not be resolved: <reason>" per failed key.
 const TRANSIENT_ALIAS_REASONS = ['timeout', 'unavailable'];
 const APPROLE_MOUNT = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+const TRUTHY = ['1', 'true', 'yes', 'on'];
+const FALSY = ['0', 'false', 'no', 'off'];
 
 class VaultEnvError extends Error {
   constructor(message, code) {
@@ -48,7 +50,7 @@ function warn(message) {
 }
 
 function truthy(v) {
-  return typeof v === 'string' && ['1', 'true', 'yes', 'on'].includes(v.trim().toLowerCase());
+  return typeof v === 'string' && TRUTHY.includes(v.trim().toLowerCase());
 }
 
 function nonEmpty(v) {
@@ -68,9 +70,10 @@ function readConfig(options, env) {
   };
 
   const skip = nonEmpty(env.VAULT_SKIP_VERIFY);
-  if (skip !== undefined && !['0', 'false', 'no', 'off'].includes(skip.toLowerCase())) {
+  if (skip !== undefined && !FALSY.includes(skip.toLowerCase())) {
     throw new VaultEnvError('VAULT_SKIP_VERIFY is set, but vault-env-loader never skips TLS verification. Unset it and point VAULT_CACERT at your CA instead.', 'config');
   }
+  const enabled = enabledSwitch(env);
 
   const addr = nonEmpty(pick('addr', 'VAULT_ADDR'));
   let imports = pick('imports', 'VAULT_ENV_IMPORT');
@@ -85,8 +88,29 @@ function readConfig(options, env) {
   let secretId = options.secretId !== undefined ? nonEmpty(options.secretId) : nonEmpty(env.VAULT_SECRET_ID);
   const appRoleGiven = Boolean(roleId || roleIdFile || secretId || secretIdFile);
 
+  // A token, when there is one, is used exactly as before AppRole support; AppRole
+  // variables beside it are left alone (they may be meant for another tool).
+  // Decided from what is set, before any file is read, so that a disabled run
+  // removes the same variables a load would.
+  const auth = token || tokenFile ? 'token' : 'approle';
+  const used = [];
+  if (auth === 'approle') {
+    if (roleId) {
+      if (options.roleId === undefined) used.push('VAULT_ROLE_ID');
+    } else if (roleIdFile && options.roleIdFile === undefined) used.push('VAULT_ROLE_ID_FILE');
+    if (secretId) {
+      if (options.secretId === undefined) used.push('VAULT_SECRET_ID');
+    } else if (secretIdFile && options.secretIdFile === undefined) used.push('VAULT_SECRET_ID_FILE');
+  }
+  const tokenFromFile = auth === 'token' && !nonEmpty(env.VAULT_TOKEN) && options.token === undefined && Boolean(tokenFile);
+  const keepToken = options.keepToken !== undefined ? Boolean(options.keepToken) : truthy(env.VAULT_ENV_KEEP_TOKEN);
+  if (enabled === false) return { configured: false, disabled: true, keepToken, tokenFromFile, appRoleVarsUsed: used };
+
   const configured = Boolean(addr || imports.length);
-  if (!configured) return { configured: false };
+  if (!configured) {
+    if (enabled) throw new VaultEnvError(ENABLED_NOT_CONFIGURED, 'config');
+    return { configured: false };
+  }
 
   if (!addr) throw new VaultEnvError('VAULT_ADDR is not set (VAULT_ENV_IMPORT is).', 'config');
   if (!imports.length) throw new VaultEnvError('VAULT_ENV_IMPORT is empty: name at least one path to load.', 'config');
@@ -98,31 +122,17 @@ function readConfig(options, env) {
     }
     if (!token) throw new VaultEnvError(`VAULT_TOKEN_FILE (${tokenFile}) is empty.`, 'config');
   }
-  // A token, when there is one, is used exactly as before AppRole support; AppRole
-  // variables beside it are left alone (they may be meant for another tool).
   const notes = [];
-  const used = [];
-  let auth = 'token';
-  if (token || tokenFile) {
+  if (auth === 'token') {
     if (appRoleGiven) notes.push('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored.');
   } else if (roleId || roleIdFile) {
-    auth = 'approle';
-    if (roleId) {
-      if (options.roleId === undefined) used.push('VAULT_ROLE_ID');
-    } else {
-      roleId = readSecretFile(roleIdFile, 'VAULT_ROLE_ID_FILE');
-      if (options.roleIdFile === undefined) used.push('VAULT_ROLE_ID_FILE');
-    }
-    if (secretId) {
-      if (options.secretId === undefined) used.push('VAULT_SECRET_ID');
-    } else if (secretIdFile) {
-      secretId = readSecretFile(secretIdFile, 'VAULT_SECRET_ID_FILE');
-      if (options.secretIdFile === undefined) used.push('VAULT_SECRET_ID_FILE');
-    }
+    if (!roleId) roleId = readSecretFile(roleIdFile, 'VAULT_ROLE_ID_FILE');
+    if (!secretId && secretIdFile) secretId = readSecretFile(secretIdFile, 'VAULT_SECRET_ID_FILE');
   } else if (appRoleGiven) {
     throw new VaultEnvError('VAULT_SECRET_ID is set but VAULT_ROLE_ID is not: AppRole login needs both.', 'config');
+  } else {
+    throw new VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config');
   }
-  if (auth === 'token' && !token) throw new VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config');
   const approleMount = nonEmpty(pick('approleMount', 'VAULT_ENV_APPROLE_MOUNT')) || 'approle';
   if (!APPROLE_MOUNT.test(approleMount) || approleMount.split('/').some((seg) => seg === '.' || seg === '..')) throw new VaultEnvError('VAULT_ENV_APPROLE_MOUNT must be a mount path such as approle.', 'config');
 
@@ -156,18 +166,28 @@ function readConfig(options, env) {
     approleMount,
     appRoleVarsUsed: used,
     notes,
-    tokenFromFile: auth === 'token' && !nonEmpty(env.VAULT_TOKEN) && options.token === undefined && Boolean(tokenFile),
+    tokenFromFile,
     namespace: nonEmpty(pick('namespace', 'VAULT_NAMESPACE')),
     ca: loadCa(nonEmpty(pick('cacert', 'VAULT_CACERT')), nonEmpty(pick('capath', 'VAULT_CAPATH'))),
     imports: imports.map(parseImport),
     base: nonEmpty(pick('base', 'VAULT_ENV_BASE')),
     override: options.override !== undefined ? Boolean(options.override) : truthy(env.VAULT_ENV_OVERRIDE),
-    keepToken: options.keepToken !== undefined ? Boolean(options.keepToken) : truthy(env.VAULT_ENV_KEEP_TOKEN),
+    keepToken,
     timeoutMs: num(pick('timeout', 'VAULT_ENV_TIMEOUT'), 10, 'VAULT_ENV_TIMEOUT') * 1000,
     retries: Math.floor(num(pick('retries', 'VAULT_ENV_RETRIES'), 3, 'VAULT_ENV_RETRIES')),
     retryDelayMs: options.retryDelayMs !== undefined ? options.retryDelayMs : 1000,
     caseInsensitive: options.caseInsensitive !== undefined ? Boolean(options.caseInsensitive) : process.platform === 'win32',
   };
+}
+
+// VAULT_ENV_ENABLED: undefined when unset or blank (0.2 behaviour), false to load
+// nothing, true to require a configuration. Anything else is a mistake, not a guess.
+function enabledSwitch(env) {
+  const v = nonEmpty(env.VAULT_ENV_ENABLED);
+  if (v === undefined) return undefined;
+  if (FALSY.includes(v.toLowerCase())) return false;
+  if (TRUTHY.includes(v.toLowerCase())) return true;
+  throw new VaultEnvError('VAULT_ENV_ENABLED must be true or false (or 1/0, yes/no, on/off).', 'config');
 }
 
 function readSecretFile(file, name) {
@@ -662,16 +682,32 @@ function apply(values, env, cfg) {
   for (const name of Object.keys(set)) env[name] = set[name];
   if (kept.length) warn(`Already set in the environment, kept as is (set VAULT_ENV_OVERRIDE=true to replace): ${kept.join(', ')}.`);
   env[LOADED_MARK] = '1';
-  if (!cfg.keepToken) {
-    delete env.VAULT_TOKEN;
-    if (cfg.tokenFromFile) delete env.VAULT_TOKEN_FILE;
-    // Only the AppRole variables this run actually used.
-    for (const name of cfg.appRoleVarsUsed || []) delete env[name];
-  }
+  stripCredentials(env, cfg);
   return Object.keys(set);
 }
 
+// After a load, and when VAULT_ENV_ENABLED is off: the application never sees the credentials.
+function stripCredentials(env, cfg) {
+  if (cfg.keepToken) return;
+  delete env.VAULT_TOKEN;
+  if (cfg.tokenFromFile) delete env.VAULT_TOKEN_FILE;
+  // Only the AppRole variables this run actually used.
+  for (const name of cfg.appRoleVarsUsed || []) delete env[name];
+}
+
 const NOT_CONFIGURED = 'VAULT_ADDR and VAULT_ENV_IMPORT are not set; nothing loaded from Vault.';
+const DISABLED = 'VAULT_ENV_ENABLED is off; nothing loaded from Vault.';
+const ENABLED_NOT_CONFIGURED = 'VAULT_ENV_ENABLED is on, but VAULT_ADDR and VAULT_ENV_IMPORT are not set.';
+
+// Nothing to load. Switched off, the credentials still leave the environment;
+// VAULT_ENV_LOADED is not set, since nothing was loaded.
+function notLoaded(env, cfg) {
+  if (cfg.disabled) {
+    warn(DISABLED);
+    stripCredentials(env, cfg);
+  } else warn(NOT_CONFIGURED);
+  return [];
+}
 
 // ---------------------------------------------------------------------------
 // Library API
@@ -679,6 +715,10 @@ const NOT_CONFIGURED = 'VAULT_ADDR and VAULT_ENV_IMPORT are not set; nothing loa
 /** Read the configured imports and return { NAME: value } without touching process.env. */
 async function fetchValues(options) {
   const cfg = readConfig(options, (options && options.env) || process.env);
+  if (cfg.disabled) {
+    warn(DISABLED);
+    return {};
+  }
   if (!cfg.configured) throw new VaultEnvError(NOT_CONFIGURED, 'config');
   const result = await collect(cfg);
   result.warnings.forEach(warn);
@@ -690,10 +730,7 @@ async function load(options) {
   const env = (options && options.env) || process.env;
   if (env[LOADED_MARK]) return [];
   const cfg = readConfig(options, env);
-  if (!cfg.configured) {
-    warn(NOT_CONFIGURED);
-    return [];
-  }
+  if (!cfg.configured) return notLoaded(env, cfg);
   const result = await collect(cfg);
   result.warnings.forEach(warn);
   return apply(result.values, env, cfg);
@@ -708,10 +745,7 @@ function loadSync(options) {
   const env = (options && options.env) || process.env;
   if (env[LOADED_MARK]) return [];
   const cfg = readConfig(options, env);
-  if (!cfg.configured) {
-    warn(NOT_CONFIGURED);
-    return [];
-  }
+  if (!cfg.configured) return notLoaded(env, cfg);
   const childEnv = Object.assign({}, process.env, env);
   // Without this the child would preload us again (NODE_OPTIONS=-r ...) and recurse.
   delete childEnv.NODE_OPTIONS;
@@ -786,6 +820,10 @@ Options (each also has an environment variable):
   --timeout <seconds>   VAULT_ENV_TIMEOUT       per request, default 10
   --retries <n>         VAULT_ENV_RETRIES       default 3
 
+Environment only:
+  VAULT_ENV_ENABLED     false: load nothing, remove the credentials, run the command
+                        true: fail unless VAULT_ADDR and VAULT_ENV_IMPORT are set
+
 Import spec:  [optional:]vault://<mount>/<path> | <relative path> | vault://   [?prefix=X_&name=auto|verbatim|upper&kv=1|2]
 Docs: https://github.com/kaylovh/vault-env-loader
 `;
@@ -833,7 +871,7 @@ function parseArgs(argv) {
 async function check(opts) {
   const cfg = readConfig(opts, process.env);
   if (!cfg.configured) {
-    process.stdout.write(`${NOT_CONFIGURED}\n`);
+    process.stdout.write(`${cfg.disabled ? DISABLED : NOT_CONFIGURED}\n`);
     return 0;
   }
   const result = await collect(cfg);
@@ -874,7 +912,7 @@ function run(opts, command) {
   if (env[LOADED_MARK]) return Promise.resolve(go());
   const cfg = readConfig(opts, env);
   if (!cfg.configured) {
-    warn(NOT_CONFIGURED);
+    notLoaded(env, cfg);
     return Promise.resolve(go());
   }
   return collect(cfg).then((result) => {
@@ -943,7 +981,7 @@ module.exports = {
   VaultEnvError,
   VERSION,
   // Exposed for tests; not part of the public API.
-  _internal: { readConfig, parseImport, envName, mapEntries, mergeImports, plan, aliasFailures, retryable, parseArgs, main },
+  _internal: { readConfig, stripCredentials, parseImport, envName, mapEntries, mergeImports, plan, aliasFailures, retryable, parseArgs, main },
 };
 
 if (require.main === module) {

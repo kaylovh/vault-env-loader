@@ -80,10 +80,24 @@ Connection settings use Vault's standard variable names, so the `vault` CLI and 
 | `VAULT_ENV_TIMEOUT` | `--timeout` | Seconds per request. Default 10. |
 | `VAULT_ENV_RETRIES` | `--retries` | Retries for transient failures. Default 3 (1 s, 2 s, 4 s). |
 | `VAULT_ENV_ALLOW_HTTP` | — | `true` to allow plain `http://` to a host other than localhost. Prints a warning on every start. |
+| `VAULT_ENV_ENABLED` | — | `false`: load nothing and run the application without Vault; `true`: Vault is required. Unset: as below. See [Switching it off](#switching-it-off-vault_env_enabled). |
 
 **TLS verification cannot be turned off.** If `VAULT_SKIP_VERIFY` is set, vault-env-loader stops with an error rather than silently ignoring it. Point `VAULT_CACERT` at your CA instead.
 
 If neither `VAULT_ADDR` nor `VAULT_ENV_IMPORT` is set, nothing is loaded and the command runs anyway — the same start command works on a laptop without Vault. Setting only some of them is an error.
+
+### Switching it off: `VAULT_ENV_ENABLED`
+
+An explicit switch, for a rollback window while the old values are still in place, for local development that keeps the Vault settings in `.env` but must not use them, or for a single run: `VAULT_ENV_ENABLED=false vault-env-loader -- node server.js`. It is not a fallback for a Vault outage: switched off, the application only has what is already in its environment.
+
+| Value (case and surrounding spaces ignored) | Behaviour |
+|---|---|
+| unset or empty | As described above. |
+| `false`, `0`, `no`, `off` | Nothing is read from Vault, no request is made and no other setting is checked. One line on stderr, `[vault-env-loader] VAULT_ENV_ENABLED is off; nothing loaded from Vault.`, then the command runs (exit code passed through); `load()` / `loadSync()` return `[]` and `fetch()` returns `{}`, `-r` / `--import` let the application start. The credentials are still removed from the application's environment, exactly as after a load (unless `VAULT_ENV_KEEP_TOKEN=true`): `VAULT_TOKEN`; `VAULT_TOKEN_FILE` when the token would come from that file; without a token, `VAULT_ROLE_ID` (or else `VAULT_ROLE_ID_FILE`) and `VAULT_SECRET_ID` (or else `VAULT_SECRET_ID_FILE`). `VAULT_ENV_LOADED` is not set. |
+| `true`, `1`, `yes`, `on` | Vault is required. If neither `VAULT_ADDR` nor `VAULT_ENV_IMPORT` is set, it fails with exit 78 and `VAULT_ENV_ENABLED is on, but VAULT_ADDR and VAULT_ENV_IMPORT are not set.` instead of running without secrets. Otherwise as usual. |
+| anything else | Fails with exit 78: `VAULT_ENV_ENABLED must be true or false (or 1/0, yes/no, on/off).` |
+
+Switched off, `check` prints `VAULT_ENV_ENABLED is off; nothing loaded from Vault.` and exits 0. `VAULT_SKIP_VERIFY` is refused whatever the switch says. Because `VAULT_ENV_LOADED` is not set, a child process that preloads vault-env-loader again (for example through `NODE_OPTIONS=-r vault-env-loader/register`) prints the line again.
 
 ## AppRole
 

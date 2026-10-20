@@ -91,3 +91,30 @@ test('authSelection', () => {
     if ('ignoredNote' in e) assert.equal(cfg.notes.some((s) => /ignored/.test(s)), e.ignoredNote, c.name);
   }
 });
+
+test('enabledSwitch', () => {
+  for (const c of cases.enabledSwitch) {
+    if (!c.name) continue; // the section's $comment
+    const env = Object.assign({}, c.env);
+    if (c.error) {
+      let err;
+      try {
+        I.readConfig({}, env);
+      } catch (e) {
+        err = e;
+      }
+      assert.ok(err instanceof VaultEnvError, `${c.name}: expected VaultEnvError, got ${err}`);
+      assert.equal(err.code, c.error, c.name);
+      assert.equal(err.message, c.message, c.name);
+      continue;
+    }
+    const cfg = I.readConfig({}, env);
+    const state = cfg.disabled ? 'disabled' : cfg.configured ? 'configured' : 'unconfigured';
+    assert.equal(state, c.expect.state, c.name);
+    if (state !== 'disabled') continue;
+    I.stripCredentials(env, cfg);
+    const removed = Object.keys(c.env).filter((k) => !(k in env)).sort();
+    assert.deepEqual(removed, c.expect.removed.slice().sort(), c.name);
+    assert.equal(env.VAULT_ENV_LOADED, undefined, c.name);
+  }
+});
