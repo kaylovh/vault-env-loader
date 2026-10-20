@@ -95,6 +95,27 @@ class Spec(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+    def test_enabled_switch(self):
+        for c in CASES['enabledSwitch']:
+            if 'name' not in c:
+                continue  # the section's $comment
+            env = dict(c['env'])
+            if 'error' in c:
+                with self.assertRaises(V.VaultEnvError, msg=c['name']) as cm:
+                    V.read_config({}, env)
+                self.assertEqual(cm.exception.code, c['error'], c['name'])
+                self.assertEqual(cm.exception.message, c['message'], c['name'])
+                continue
+            cfg = V.read_config({}, env)
+            state = 'disabled' if cfg.get('disabled') else 'configured' if cfg['configured'] else 'unconfigured'
+            self.assertEqual(state, c['expect']['state'], c['name'])
+            if state != 'disabled':
+                continue
+            V.strip_credentials(env, cfg)
+            removed = sorted(k for k in c['env'] if k not in env)
+            self.assertEqual(removed, sorted(c['expect']['removed']), c['name'])
+            self.assertNotIn('VAULT_ENV_LOADED', env, c['name'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0 — 2026-10-19
+
+- `VAULT_ENV_ENABLED`: an explicit on/off switch. `false` / `0` / `no` / `off`: no request to Vault, one line on stderr (`VAULT_ENV_ENABLED is off; nothing loaded from Vault.`), the command runs, `load()` returns `[]`, `fetch()` returns `{}`, `check` prints the same line and exits 0; the credentials are still removed from the application's environment as after a load (unless `VAULT_ENV_KEEP_TOKEN=true`), and `VAULT_ENV_LOADED` is not set. `true` / `1` / `yes` / `on`: Vault is required, so a missing `VAULT_ADDR` and `VAULT_ENV_IMPORT` fails with exit 78 instead of running without secrets. Any other value fails with exit 78. `VAULT_SKIP_VERIFY` is still refused first, whatever the switch says.
+- Unset or empty: no change; behaviour, output and exit codes are those of 0.2.0.
+
 ## 0.2.0 — 2026-10-17
 
 - AppRole authentication: `VAULT_ROLE_ID` / `VAULT_ROLE_ID_FILE`, `VAULT_SECRET_ID` / `VAULT_SECRET_ID_FILE`, `VAULT_ENV_APPROLE_MOUNT` (and `role_id`, `secret_id`, `approle_mount`, … as keyword options). Used only when no token is set: logs in once, reads, revokes the session with `auth/token/revoke-self`, then starts the command; the variables it used are removed from the command's environment.

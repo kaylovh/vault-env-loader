@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'
 __all__ = ['load', 'fetch', 'VaultEnvError', '__version__']
 
 TAG = '[vault-env-loader]'
@@ -87,6 +87,7 @@ def read_config(options=None, env=None):
     if skip is not None and skip.lower() not in FALSY:
         raise VaultEnvError('VAULT_SKIP_VERIFY is set, but vault-env-loader never skips TLS verification. '
                             'Unset it and point VAULT_CACERT at your CA instead.', 'config')
+    enabled = enabled_switch(env)
 
     addr = non_empty(pick('addr', 'VAULT_ADDR'))
     imports = pick('imports', 'VAULT_ENV_IMPORT')
@@ -102,7 +103,36 @@ def read_config(options=None, env=None):
     secret_id = non_empty(options['secret_id']) if options.get('secret_id') is not None else non_empty(env.get('VAULT_SECRET_ID'))
     approle_given = bool(role_id or role_id_file or secret_id or secret_id_file)
 
+    # A token, when there is one, is used exactly as before AppRole support; AppRole
+    # variables beside it are left alone (they may be meant for another tool).
+    # Decided from what is set, before any file is read, so that a disabled run
+    # removes the same variables a load would.
+    auth = 'token' if token or token_file else 'approle'
+    used = []
+    if auth == 'approle':
+        if role_id:
+            if options.get('role_id') is None:
+                used.append('VAULT_ROLE_ID')
+        elif role_id_file and options.get('role_id_file') is None:
+            used.append('VAULT_ROLE_ID_FILE')
+        if secret_id:
+            if options.get('secret_id') is None:
+                used.append('VAULT_SECRET_ID')
+        elif secret_id_file and options.get('secret_id_file') is None:
+            used.append('VAULT_SECRET_ID_FILE')
+    token_from_file = auth == 'token' and non_empty(env.get('VAULT_TOKEN')) is None and options.get('token') is None and bool(token_file)
+
+    def flag(opt, var):
+        return bool(options[opt]) if options.get(opt) is not None else truthy(env.get(var))
+
+    keep_token = flag('keep_token', 'VAULT_ENV_KEEP_TOKEN')
+    if enabled is False:
+        return {'configured': False, 'disabled': True, 'keep_token': keep_token,
+                'token_from_file': token_from_file, 'approle_vars_used': used}
+
     if not addr and not imports:
+        if enabled:
+            raise VaultEnvError(ENABLED_NOT_CONFIGURED, 'config')
         return {'configured': False}
 
     if not addr:
@@ -117,33 +147,18 @@ def read_config(options=None, env=None):
             raise VaultEnvError('Cannot read VAULT_TOKEN_FILE (%s): %s.' % (token_file, _errno_name(e)), 'config')
         if not token:
             raise VaultEnvError('VAULT_TOKEN_FILE (%s) is empty.' % token_file, 'config')
-    # A token, when there is one, is used exactly as before AppRole support; AppRole
-    # variables beside it are left alone (they may be meant for another tool).
     notes = []
-    used = []
-    auth = 'token'
-    if token or token_file:
+    if auth == 'token':
         if approle_given:
             notes.append('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored.')
     elif role_id or role_id_file:
-        auth = 'approle'
-        if role_id:
-            if options.get('role_id') is None:
-                used.append('VAULT_ROLE_ID')
-        else:
+        if not role_id:
             role_id = _read_secret_file(role_id_file, 'VAULT_ROLE_ID_FILE')
-            if options.get('role_id_file') is None:
-                used.append('VAULT_ROLE_ID_FILE')
-        if secret_id:
-            if options.get('secret_id') is None:
-                used.append('VAULT_SECRET_ID')
-        elif secret_id_file:
+        if not secret_id and secret_id_file:
             secret_id = _read_secret_file(secret_id_file, 'VAULT_SECRET_ID_FILE')
-            if options.get('secret_id_file') is None:
-                used.append('VAULT_SECRET_ID_FILE')
     elif approle_given:
         raise VaultEnvError('VAULT_SECRET_ID is set but VAULT_ROLE_ID is not: AppRole login needs both.', 'config')
-    if auth == 'token' and not token:
+    else:
         raise VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config')
     approle_mount = non_empty(pick('approle_mount', 'VAULT_ENV_APPROLE_MOUNT')) or 'approle'
     if not APPROLE_MOUNT.match(approle_mount) or any(seg in ('.', '..') for seg in approle_mount.split('/')):
@@ -170,9 +185,6 @@ def read_config(options=None, env=None):
             raise VaultEnvError('%s must be a non-negative number.' % name, 'config')
         return n
 
-    def flag(opt, var):
-        return bool(options[opt]) if options.get(opt) is not None else truthy(env.get(var))
-
     return {
         'configured': True,
         'addr': addr.rstrip('/'),
@@ -184,18 +196,31 @@ def read_config(options=None, env=None):
         'approle_mount': approle_mount,
         'approle_vars_used': used,
         'notes': notes,
-        'token_from_file': auth == 'token' and non_empty(env.get('VAULT_TOKEN')) is None and options.get('token') is None and bool(token_file),
+        'token_from_file': token_from_file,
         'namespace': non_empty(pick('namespace', 'VAULT_NAMESPACE')),
         'ssl_context': ssl_context(non_empty(pick('cacert', 'VAULT_CACERT')), non_empty(pick('capath', 'VAULT_CAPATH'))),
         'imports': [parse_import(i) for i in imports],
         'base': non_empty(pick('base', 'VAULT_ENV_BASE')),
         'override': flag('override', 'VAULT_ENV_OVERRIDE'),
-        'keep_token': flag('keep_token', 'VAULT_ENV_KEEP_TOKEN'),
+        'keep_token': keep_token,
         'timeout': num(pick('timeout', 'VAULT_ENV_TIMEOUT'), 10, 'VAULT_ENV_TIMEOUT'),
         'retries': int(num(pick('retries', 'VAULT_ENV_RETRIES'), 3, 'VAULT_ENV_RETRIES')),
         'retry_delay': options['retry_delay'] if options.get('retry_delay') is not None else 1.0,
         'case_insensitive': bool(options['case_insensitive']) if options.get('case_insensitive') is not None else os.name == 'nt',
     }
+
+
+def enabled_switch(env):
+    """VAULT_ENV_ENABLED: None when unset or blank (0.2 behaviour), False to load nothing,
+    True to require a configuration. Anything else is a mistake, not a guess."""
+    v = non_empty(env.get('VAULT_ENV_ENABLED'))
+    if v is None:
+        return None
+    if v.lower() in FALSY:
+        return False
+    if v.lower() in TRUTHY:
+        return True
+    raise VaultEnvError('VAULT_ENV_ENABLED must be true or false (or 1/0, yes/no, on/off).', 'config')
 
 
 def _read_secret_file(path, name):
@@ -725,17 +750,36 @@ def apply(values, env, cfg):
     if p['kept']:
         warn('Already set in the environment, kept as is (set VAULT_ENV_OVERRIDE=true to replace): %s.' % ', '.join(p['kept']))
     env[LOADED_MARK] = '1'
-    if not cfg['keep_token']:
-        env.pop('VAULT_TOKEN', None)
-        if cfg['token_from_file']:
-            env.pop('VAULT_TOKEN_FILE', None)
-        # Only the AppRole variables this run actually used.
-        for name in cfg.get('approle_vars_used') or []:
-            env.pop(name, None)
+    strip_credentials(env, cfg)
     return list(p['set'])
 
 
+def strip_credentials(env, cfg):
+    """After a load, and when VAULT_ENV_ENABLED is off: the application never sees the credentials."""
+    if cfg['keep_token']:
+        return
+    env.pop('VAULT_TOKEN', None)
+    if cfg['token_from_file']:
+        env.pop('VAULT_TOKEN_FILE', None)
+    # Only the AppRole variables this run actually used.
+    for name in cfg.get('approle_vars_used') or []:
+        env.pop(name, None)
+
+
 NOT_CONFIGURED = 'VAULT_ADDR and VAULT_ENV_IMPORT are not set; nothing loaded from Vault.'
+DISABLED = 'VAULT_ENV_ENABLED is off; nothing loaded from Vault.'
+ENABLED_NOT_CONFIGURED = 'VAULT_ENV_ENABLED is on, but VAULT_ADDR and VAULT_ENV_IMPORT are not set.'
+
+
+def _not_loaded(env, cfg):
+    """Nothing to load. Switched off, the credentials still leave the environment;
+    VAULT_ENV_LOADED is not set, since nothing was loaded."""
+    if cfg.get('disabled'):
+        warn(DISABLED)
+        strip_credentials(env, cfg)
+    else:
+        warn(NOT_CONFIGURED)
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +793,9 @@ def fetch(env=None, **options):
     capath, timeout, retries, allow_http.
     """
     cfg = read_config(options, os.environ if env is None else env)
+    if cfg.get('disabled'):
+        warn(DISABLED)
+        return {}
     if not cfg['configured']:
         raise VaultEnvError(NOT_CONFIGURED, 'config')
     result = collect(cfg)
@@ -769,8 +816,7 @@ def load(env=None, **options):
         return []
     cfg = read_config(options, env)
     if not cfg['configured']:
-        warn(NOT_CONFIGURED)
-        return []
+        return _not_loaded(env, cfg)
     result = collect(cfg)
     for w in result['warnings']:
         warn(w)
@@ -799,6 +845,10 @@ Options (each also has an environment variable):
   --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN (or the AppRole variables) on to the command
   --timeout <seconds>   VAULT_ENV_TIMEOUT       per request, default 10
   --retries <n>         VAULT_ENV_RETRIES       default 3
+
+Environment only:
+  VAULT_ENV_ENABLED     false: load nothing, remove the credentials, run the command
+                        true: fail unless VAULT_ADDR and VAULT_ENV_IMPORT are set
 
 Import spec:  [optional:]vault://<mount>/<path> | <relative path> | vault://   [?prefix=X_&name=auto|verbatim|upper&kv=1|2]
 Docs: https://github.com/kaylovh/vault-env-loader
@@ -860,7 +910,7 @@ def parse_args(argv):
 def check(opts):
     cfg = read_config(opts, os.environ)
     if not cfg['configured']:
-        sys.stdout.write(NOT_CONFIGURED + '\n')
+        sys.stdout.write((DISABLED if cfg.get('disabled') else NOT_CONFIGURED) + '\n')
         return 0
     result = collect(cfg)
     me = result['self']
@@ -910,7 +960,7 @@ def run(opts, command):
     if not env.get(LOADED_MARK):
         cfg = read_config(opts, env)
         if not cfg['configured']:
-            warn(NOT_CONFIGURED)
+            _not_loaded(env, cfg)
         else:
             result = collect(cfg)
             for w in result['warnings']:

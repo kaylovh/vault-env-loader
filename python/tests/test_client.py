@@ -295,7 +295,7 @@ ROUTES = {
 
 def child_env(addr, **extra):
     env = dict(os.environ)
-    for k in ('DB_PASSWORD', 'VAULT_ENV_LOADED', 'VAULT_TOKEN_FILE', 'VAULT_ENV_BASE'):
+    for k in ('DB_PASSWORD', 'VAULT_ENV_LOADED', 'VAULT_TOKEN_FILE', 'VAULT_ENV_BASE', 'VAULT_ENV_ENABLED'):
         env.pop(k, None)
     env.update({'VAULT_ADDR': addr, 'VAULT_TOKEN': TOKEN, 'VAULT_ENV_IMPORT': 'database', 'VAULT_ENV_RETRIES': '0'})
     env.update(extra)
@@ -339,7 +339,7 @@ class Processes(unittest.TestCase):
 
     def test_not_configured_runs_anyway(self):
         env = dict(os.environ)
-        for k in ('VAULT_ADDR', 'VAULT_ENV_IMPORT', 'VAULT_ENV_LOADED'):
+        for k in ('VAULT_ADDR', 'VAULT_ENV_IMPORT', 'VAULT_ENV_LOADED', 'VAULT_ENV_ENABLED'):
             env.pop(k, None)
         code, out, err = run([sys.executable, MODULE, '--', sys.executable, '-c', 'print("RAN")'], env)
         self.assertEqual(code, 0)
@@ -521,6 +521,110 @@ class AppRole(unittest.TestCase):
             self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
             self.assertEqual(v.paths()[0], 'auth/ci/approle/login')
 
+
+
+# ---------------------------------------------------------------------------
+# VAULT_ENV_ENABLED
+
+def line(message):
+    return '[vault-env-loader] %s\n' % message
+
+
+OFF = 'VAULT_ENV_ENABLED is off; nothing loaded from Vault.'
+ON_UNCONFIGURED = 'VAULT_ENV_ENABLED is on, but VAULT_ADDR and VAULT_ENV_IMPORT are not set.'
+BAD_SWITCH = 'VAULT_ENV_ENABLED must be true or false (or 1/0, yes/no, on/off).'
+
+
+def unconfigured_env(**extra):
+    env = {k: v for k, v in os.environ.items() if not k.startswith('VAULT_')}
+    env.update(extra)
+    return env
+
+
+class EnabledSwitch(unittest.TestCase):
+    def test_off_load_reads_nothing_and_removes_the_token(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            env = base_env(v.addr, VAULT_ENV_IMPORT='database', VAULT_ENV_ENABLED='false')
+            with captured_stderr() as err:
+                self.assertEqual(V.load(env=env, **FAST), [])
+            self.assertEqual(err.getvalue(), line(OFF))
+            self.assertNotIn('VAULT_TOKEN', env)
+            self.assertNotIn('VAULT_ENV_LOADED', env)
+            self.assertEqual(env['VAULT_ADDR'], v.addr)
+            self.assertEqual(v.requests, [])
+
+    def test_off_fetch_returns_nothing_and_leaves_env_alone(self):
+        env = {'VAULT_ADDR': 'https://vault.example.com', 'VAULT_TOKEN': 't', 'VAULT_ENV_IMPORT': 'db', 'VAULT_ENV_ENABLED': 'off'}
+        with captured_stderr() as err:
+            self.assertEqual(V.fetch(env=env), {})
+        self.assertEqual(err.getvalue(), line(OFF))
+        self.assertEqual(env['VAULT_TOKEN'], 't')
+
+    def test_off_wrapper_python_m_and_entry_file(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            env = child_env(v.addr, VAULT_ENV_ENABLED='No', PYTHONPATH=os.path.join(HERE, '..'))
+            runs = [
+                [sys.executable, MODULE, '--', sys.executable, '-c', PRINT_ENV + '; raise SystemExit(3)'],
+                [sys.executable, '-m', 'vault_env_loader', '--', sys.executable, '-c', PRINT_ENV + '; raise SystemExit(3)'],
+                [sys.executable, '-c', 'import vault_env_loader; vault_env_loader.load(); ' + PRINT_ENV + '; raise SystemExit(3)'],
+            ]
+            for args in runs:
+                code, out, err = run(args, env)
+                self.assertEqual(code, 3, err)
+                self.assertEqual(json.loads(out), {'p': None, 't': None, 'l': None}, args[1])
+                self.assertEqual(err.replace('\r\n', '\n'), line(OFF), args[1])
+            self.assertEqual(v.requests, [])
+
+    def test_off_keep_token_and_approle_variables(self):
+        code, out, err = run([sys.executable, MODULE, '--', sys.executable, '-c', PRINT_ENV],
+                             unconfigured_env(VAULT_ENV_ENABLED='false', VAULT_TOKEN=TOKEN, VAULT_ENV_KEEP_TOKEN='true'))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)['t'], TOKEN)
+        show = ('import json, os; print(json.dumps([os.environ.get(k) for k in '
+                '("VAULT_ROLE_ID", "VAULT_SECRET_ID_FILE", "VAULT_ADDR")]))')
+        code, out, err = run([sys.executable, MODULE, '--', sys.executable, '-c', show],
+                             unconfigured_env(VAULT_ENV_ENABLED='false', VAULT_ADDR='https://vault.example.com',
+                                              VAULT_ROLE_ID='r', VAULT_SECRET_ID_FILE='/nonexistent/secret-id'))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), [None, None, 'https://vault.example.com'])
+
+    def test_off_check_says_so(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            code, out, err = run([sys.executable, MODULE, 'check'], child_env(v.addr, VAULT_ENV_ENABLED='false'))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.replace('\r\n', '\n'), OFF + '\n')
+            self.assertEqual(err, '')
+            self.assertEqual(v.requests, [])
+
+    def test_on_loads_when_configured_and_fails_when_not(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            code, out, err = run([sys.executable, MODULE, '--', sys.executable, '-c', PRINT_ENV], child_env(v.addr, VAULT_ENV_ENABLED='true'))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(out), {'p': 's3cr3t', 't': None, 'l': '1'})
+        for args in (['--', sys.executable, '-c', 'print("RAN")'], ['check']):
+            code, out, err = run([sys.executable, MODULE] + args, unconfigured_env(VAULT_ENV_ENABLED='on', VAULT_TOKEN=TOKEN))
+            self.assertEqual(code, 78, args)
+            self.assertEqual(out, '')
+            self.assertEqual(err.replace('\r\n', '\n'), line(ON_UNCONFIGURED))
+        with self.assertRaises(V.VaultEnvError) as cm:
+            V.load(env={'VAULT_ENV_ENABLED': '1'})
+        self.assertEqual(cm.exception.code, 'config')
+
+    def test_any_other_value_fails_and_reads_nothing(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            for args in (['--', sys.executable, '-c', 'print("RAN")'], ['check']):
+                code, out, err = run([sys.executable, MODULE] + args, child_env(v.addr, VAULT_ENV_ENABLED='ture'))
+                self.assertEqual(code, 78, args)
+                self.assertEqual(out, '')
+                self.assertEqual(err.replace('\r\n', '\n'), line(BAD_SWITCH))
+            self.assertEqual(v.requests, [])
+
+    def test_skip_verify_is_refused_even_when_off(self):
+        code, out, err = run([sys.executable, MODULE, '--', sys.executable, '-c', 'print("RAN")'],
+                             unconfigured_env(VAULT_ENV_ENABLED='false', VAULT_SKIP_VERIFY='true'))
+        self.assertEqual(code, 78)
+        self.assertEqual(out, '')
+        self.assertIn('VAULT_SKIP_VERIFY is set', err)
 
 if __name__ == '__main__':
     unittest.main()
