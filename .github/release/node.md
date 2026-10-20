@@ -11,6 +11,7 @@ Load secrets from HashiCorp Vault's KV engine into environment variables **befor
 - **Spring Cloud Vault style imports**: `vault://secret/my-app/prod/database`.
 - **The token stays out of your application**: `VAULT_TOKEN` is removed from the environment it sees.
 - **Token or AppRole**: with AppRole it logs in once per start, reads, and revokes the session before the application runs.
+- **An explicit switch**: `VAULT_ENV_ENABLED=false` runs the application without Vault (and without the credentials); `true` makes Vault required.
 - Works with HashiCorp Vault (KV v1 and v2, detected automatically) and Vault-compatible servers.
 
 ## Install

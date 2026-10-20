@@ -4,8 +4,8 @@ Load secrets from HashiCorp Vault's KV engine into environment variables **befor
 
 | Language | Package | Status |
 |---|---|---|
-| Node.js | [`node/`](./node) — `npm install vault-env-loader` | 0.1.0 |
-| Python | [`python/`](./python) — `pip install vault-env-loader` | 0.1.0 |
+| Node.js | [`node/`](./node) — `npm install vault-env-loader` | 0.3.0 |
+| Python | [`python/`](./python) — `pip install vault-env-loader` | 0.3.0 |
 
 Both implementations follow one behaviour contract — import syntax, variable naming, precedence, failure handling — checked by the shared cases in [`spec/cases.json`](./spec/cases.json).
 
