@@ -37,6 +37,10 @@ jobs:
       matrix:
         python: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
         os: [ubuntu-latest, macos-latest]
+        exclude:
+          # setup-python has no 3.9 for the current Ubuntu runner: the legacy job runs it in a container.
+          - python: '3.9'
+            os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -49,13 +53,13 @@ jobs:
       - run: python -W error -m unittest discover -s tests -t tests -v
 
   legacy:
-    # setup-python has no 3.6 / 3.7 / 3.8 for current runners: use the official images.
+    # setup-python has no 3.6 / 3.7 / 3.8 (nor 3.9 on Ubuntu) for current runners: use the official images.
     # Installs the wheel built above with the old pip, then runs the tests.
     needs: build
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.6', '3.7', '3.8']
+        python: ['3.6', '3.7', '3.8', '3.9']
     runs-on: ubuntu-latest
     container: python:${{ matrix.python }}-slim
     steps:

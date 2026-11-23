@@ -305,7 +305,8 @@ def child_env(addr, **extra):
 def run(args, env, timeout=30):
     p = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = p.communicate(timeout=timeout)
-    return p.returncode, out.decode(), err.decode()
+    # Windows writes \r\n for each line a child prints; compare lines, not line endings.
+    return p.returncode, out.decode().replace('\r\n', '\n'), err.decode().replace('\r\n', '\n')
 
 
 class Processes(unittest.TestCase):
