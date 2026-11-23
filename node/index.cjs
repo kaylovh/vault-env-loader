@@ -19,8 +19,9 @@ const http = require('http');
 const https = require('https');
 const tls = require('tls');
 const childProcess = require('child_process');
+const crypto = require('crypto');
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const TAG = '[vault-env-loader]';
 const EX_CONFIG = 78;
 const LOADED_MARK = 'VAULT_ENV_LOADED';
@@ -36,6 +37,8 @@ const TRANSIENT_ALIAS_REASONS = ['timeout', 'unavailable'];
 const APPROLE_MOUNT = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 const TRUTHY = ['1', 'true', 'yes', 'on'];
 const FALSY = ['0', 'false', 'no', 'off'];
+const ASSERTION_LIFETIME = 120;
+const CERT_WARN_DAYS = 30;
 
 class VaultEnvError extends Error {
   constructor(message, code) {
@@ -87,20 +90,35 @@ function readConfig(options, env) {
   const secretIdFile = nonEmpty(pick('secretIdFile', 'VAULT_SECRET_ID_FILE'));
   let secretId = options.secretId !== undefined ? nonEmpty(options.secretId) : nonEmpty(env.VAULT_SECRET_ID);
   const appRoleGiven = Boolean(roleId || roleIdFile || secretId || secretIdFile);
+  // Certificate login: only VAULT_CLIENT_CERTIFICATE_PATH selects it. A key path or
+  // password without it changes nothing, as in 0.3. The password is taken as it is.
+  const certPath = nonEmpty(pick('clientCertificatePath', 'VAULT_CLIENT_CERTIFICATE_PATH'));
+  const keyPath = certPath ? nonEmpty(pick('clientKeyPath', 'VAULT_CLIENT_KEY_PATH')) : undefined;
+  const passwordGiven = options.clientCertificatePassword !== undefined && options.clientCertificatePassword !== null;
+  let password = passwordGiven ? String(options.clientCertificatePassword) : env.VAULT_CLIENT_CERTIFICATE_PASSWORD;
+  if (password === '') password = undefined;
+  const passwordFile = nonEmpty(pick('clientCertificatePasswordFile', 'VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE'));
 
   // A token, when there is one, is used exactly as before AppRole support; AppRole
   // variables beside it are left alone (they may be meant for another tool).
   // Decided from what is set, before any file is read, so that a disabled run
   // removes the same variables a load would.
-  const auth = token || tokenFile ? 'token' : 'approle';
+  const auth = token || tokenFile ? 'token' : certPath && (roleId || roleIdFile) && !(secretId || secretIdFile) ? 'certificate' : 'approle';
   const used = [];
-  if (auth === 'approle') {
+  if (auth !== 'token') {
     if (roleId) {
       if (options.roleId === undefined) used.push('VAULT_ROLE_ID');
     } else if (roleIdFile && options.roleIdFile === undefined) used.push('VAULT_ROLE_ID_FILE');
     if (secretId) {
       if (options.secretId === undefined) used.push('VAULT_SECRET_ID');
     } else if (secretIdFile && options.secretIdFile === undefined) used.push('VAULT_SECRET_ID_FILE');
+    if (certPath) {
+      if (options.clientCertificatePath === undefined) used.push('VAULT_CLIENT_CERTIFICATE_PATH');
+      if (keyPath && options.clientKeyPath === undefined) used.push('VAULT_CLIENT_KEY_PATH');
+      if (password !== undefined) {
+        if (!passwordGiven) used.push('VAULT_CLIENT_CERTIFICATE_PASSWORD');
+      } else if (passwordFile && options.clientCertificatePasswordFile === undefined) used.push('VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE');
+    }
   }
   const tokenFromFile = auth === 'token' && !nonEmpty(env.VAULT_TOKEN) && options.token === undefined && Boolean(tokenFile);
   const keepToken = options.keepToken !== undefined ? Boolean(options.keepToken) : truthy(env.VAULT_ENV_KEEP_TOKEN);
@@ -124,17 +142,27 @@ function readConfig(options, env) {
   }
   const notes = [];
   if (auth === 'token') {
-    if (appRoleGiven) notes.push('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored.');
+    if (certPath) notes.push('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID / VAULT_CLIENT_CERTIFICATE_PATH are ignored.');
+    else if (appRoleGiven) notes.push('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored.');
   } else if (roleId || roleIdFile) {
+    if (certPath && auth !== 'certificate') {
+      throw new VaultEnvError('Both a secret ID and a client certificate are set (VAULT_SECRET_ID / VAULT_CLIENT_CERTIFICATE_PATH): AppRole login takes one or the other.', 'config');
+    }
     if (!roleId) roleId = readSecretFile(roleIdFile, 'VAULT_ROLE_ID_FILE');
-    if (!secretId && secretIdFile) secretId = readSecretFile(secretIdFile, 'VAULT_SECRET_ID_FILE');
+    if (auth === 'certificate') {
+      if (password === undefined && passwordFile) password = readPasswordFile(passwordFile);
+    } else if (!secretId && secretIdFile) secretId = readSecretFile(secretIdFile, 'VAULT_SECRET_ID_FILE');
+  } else if (certPath) {
+    throw new VaultEnvError('VAULT_CLIENT_CERTIFICATE_PATH is set but VAULT_ROLE_ID is not: certificate login needs both.', 'config');
   } else if (appRoleGiven) {
     throw new VaultEnvError('VAULT_SECRET_ID is set but VAULT_ROLE_ID is not: AppRole login needs both.', 'config');
   } else {
     throw new VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config');
   }
   const approleMount = nonEmpty(pick('approleMount', 'VAULT_ENV_APPROLE_MOUNT')) || 'approle';
-  if (!APPROLE_MOUNT.test(approleMount) || approleMount.split('/').some((seg) => seg === '.' || seg === '..')) throw new VaultEnvError('VAULT_ENV_APPROLE_MOUNT must be a mount path such as approle.', 'config');
+  if (!validMount(approleMount)) throw new VaultEnvError('VAULT_ENV_APPROLE_MOUNT must be a mount path such as approle.', 'config');
+  const jwtMount = auth === 'certificate' ? nonEmpty(pick('jwtMount', 'VAULT_ENV_JWT_MOUNT')) || 'jwt' : undefined;
+  if (jwtMount !== undefined && !validMount(jwtMount)) throw new VaultEnvError('VAULT_ENV_JWT_MOUNT must be a mount path such as jwt.', 'config');
 
   let url;
   try {
@@ -161,9 +189,14 @@ function readConfig(options, env) {
     insecureHttp: url.protocol === 'http:' && !isLoopback(url.hostname),
     auth,
     token: auth === 'token' ? token : null,
-    roleId: auth === 'approle' ? roleId : undefined,
+    roleId: auth !== 'token' ? roleId : undefined,
     secretId: auth === 'approle' ? secretId : undefined,
     approleMount,
+    certificatePath: auth === 'certificate' ? certPath : undefined,
+    keyPath: auth === 'certificate' ? keyPath : undefined,
+    password: auth === 'certificate' ? password : undefined,
+    jwtMount,
+    rawAddr: addr,
     appRoleVarsUsed: used,
     notes,
     tokenFromFile,
@@ -199,6 +232,23 @@ function readSecretFile(file, name) {
   }
   if (!v) throw new VaultEnvError(`${name} (${file}) is empty.`, 'config');
   return v;
+}
+
+// A password file loses one trailing line break, nothing else: a password may
+// begin or end with spaces.
+function readPasswordFile(file) {
+  let v;
+  try {
+    v = fs.readFileSync(file, 'utf8').replace(/\r?\n$/, '');
+  } catch (e) {
+    throw new VaultEnvError(`Cannot read VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE (${file}): ${e.code || 'error'}.`, 'config');
+  }
+  if (!v) throw new VaultEnvError(`VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE (${file}) is empty.`, 'config');
+  return v;
+}
+
+function validMount(m) {
+  return APPROLE_MOUNT.test(m) && !m.split('/').some((seg) => seg === '.' || seg === '..');
 }
 
 function isLoopback(host) {
@@ -448,14 +498,236 @@ async function appRoleLogin(cfg) {
 
 // Best effort: the session expires by itself if this fails.
 async function revokeSession(cfg) {
+  const what = cfg.auth === 'certificate' ? 'certificate login session' : 'AppRole session';
   try {
     const res = await httpRequest(cfg, 'POST', 'auth/token/revoke-self');
-    if (res.status !== 204 && res.status !== 200) warn(`Could not revoke the AppRole session (HTTP ${res.status}); it expires by itself.`);
+    if (res.status !== 204 && res.status !== 200) warn(`Could not revoke the ${what} (HTTP ${res.status}); it expires by itself.`);
   } catch (e) {
-    warn(`Could not revoke the AppRole session (${e.code || 'network error'}); it expires by itself.`);
+    warn(`Could not revoke the ${what} (${e.code || 'network error'}); it expires by itself.`);
   } finally {
     cfg.token = null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Certificate login: sign a short-lived JWT (a client assertion) with the private
+// key, log in with auth/<mount>/login {role, jwt}, read, revoke the session.
+// One code path on every Node version: no X509Certificate, no 'base64url' and no
+// asymmetricKeyDetails, none of which Node 14 has; the certificate's validity and
+// public key come from a small DER walk.
+
+const PEM_CERT = /-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----/;
+const PEM_KEY = /-----BEGIN ((?:RSA |EC |ENCRYPTED )?PRIVATE KEY)-----[\s\S]+?-----END \1-----/;
+// DER of the named-curve OIDs inside a SubjectPublicKeyInfo.
+const CURVES = [
+  { alg: 'ES256', hash: 'sha256', size: 32, oid: Buffer.from('06082a8648ce3d030107', 'hex') },
+  { alg: 'ES384', hash: 'sha384', size: 48, oid: Buffer.from('06052b81040022', 'hex') },
+];
+
+function b64url(buf) {
+  return buf.toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+// One DER TLV at `pos`: { tag, start (of the value), end }.
+function derItem(buf, pos) {
+  if (pos + 2 > buf.length) throw new Error('truncated');
+  const tag = buf[pos];
+  let len = buf[pos + 1];
+  let start = pos + 2;
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    if (n < 1 || n > 4 || start + n > buf.length) throw new Error('bad length');
+    len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[start + i];
+    start += n;
+  }
+  if (start + len > buf.length) throw new Error('truncated');
+  return { tag, pos, start, end: start + len };
+}
+
+function derChildren(buf, item) {
+  const out = [];
+  for (let pos = item.start; pos < item.end; ) {
+    const c = derItem(buf, pos);
+    out.push(c);
+    pos = c.end;
+  }
+  return out;
+}
+
+function derTime(buf, item) {
+  const s = buf.slice(item.start, item.end).toString('latin1');
+  let m;
+  if (item.tag === 0x17 && (m = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s))) {
+    const yy = Number(m[1]);
+    return Date.UTC(yy < 50 ? 2000 + yy : 1900 + yy, m[2] - 1, m[3], m[4], m[5], m[6]) / 1000;
+  }
+  if (item.tag === 0x18 && (m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\.\d+)?Z$/.exec(s))) {
+    return Date.UTC(Number(m[1]), m[2] - 1, m[3], m[4], m[5], m[6]) / 1000;
+  }
+  throw new Error('bad time');
+}
+
+// Certificate DER -> { notAfter (epoch seconds), spki (DER) }.
+function parseCertificateDer(der) {
+  const cert = derItem(der, 0);
+  const tbs = derChildren(der, cert)[0];
+  const f = derChildren(der, tbs);
+  const i = f[0].tag === 0xa0 ? 1 : 0; // [0] version is optional
+  const validity = derChildren(der, f[i + 3]);
+  const spki = f[i + 5];
+  if (validity.length !== 2 || spki.tag !== 0x30) throw new Error('bad certificate');
+  return { notAfter: derTime(der, validity[1]), spki: der.slice(spki.pos, spki.end) };
+}
+
+/**
+ * Read the certificate and its private key. Every problem is a config error,
+ * raised before any request; messages name files, never their contents.
+ */
+function loadClientCertificate(certPath, keyPath, password) {
+  const read = (file, what) => {
+    try {
+      return fs.readFileSync(file, 'latin1');
+    } catch (e) {
+      throw new VaultEnvError(`Cannot read the client ${what} file (${file}): ${e.code || 'error'}.`, 'config');
+    }
+  };
+  const certText = read(certPath, 'certificate');
+  const cm = PEM_CERT.exec(certText);
+  if (!cm) {
+    throw new VaultEnvError(`The client certificate file (${certPath}) holds no PEM certificate (-----BEGIN CERTIFICATE-----). PKCS#12 / PFX is not supported: convert it to PEM.`, 'config');
+  }
+  const der = Buffer.from(cm[1].replace(/\s+/g, ''), 'base64');
+  let parsed;
+  let certKey;
+  try {
+    parsed = parseCertificateDer(der);
+    certKey = crypto.createPublicKey({ key: parsed.spki, format: 'der', type: 'spki' });
+  } catch (e) {
+    throw new VaultEnvError(`The client certificate file (${certPath}) does not hold a valid X.509 certificate.`, 'config');
+  }
+  const keyFile = keyPath || certPath;
+  const keyText = keyPath ? read(keyPath, 'key') : certText;
+  const km = PEM_KEY.exec(keyText);
+  if (!km) {
+    throw new VaultEnvError(keyPath ? `No private key in the client key file (${keyPath}).` : `No private key in the client certificate file (${certPath}): put the key in the same PEM file, or set VAULT_CLIENT_KEY_PATH.`, 'config');
+  }
+  const encrypted = km[1] === 'ENCRYPTED PRIVATE KEY' || /Proc-Type:\s*4,ENCRYPTED/.test(km[0]);
+  if (encrypted && password === undefined) {
+    throw new VaultEnvError(`The private key in ${keyFile} is encrypted: set VAULT_CLIENT_CERTIFICATE_PASSWORD or VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE.`, 'config');
+  }
+  let key;
+  try {
+    key = crypto.createPrivateKey(encrypted ? { key: km[0], format: 'pem', passphrase: password } : { key: km[0], format: 'pem' });
+  } catch (e) {
+    throw new VaultEnvError(encrypted ? `Cannot decrypt the private key in ${keyFile}: wrong password.` : `The private key in ${keyFile} is not a valid PEM key.`, 'config');
+  }
+  const spki = crypto.createPublicKey(key).export({ type: 'spki', format: 'der' });
+  let alg;
+  let curve;
+  if (key.asymmetricKeyType === 'rsa') alg = 'RS256';
+  else if (key.asymmetricKeyType === 'ec') {
+    curve = CURVES.find((c) => spki.indexOf(c.oid) >= 0);
+    if (curve) alg = curve.alg;
+  }
+  if (!alg) throw new VaultEnvError(`Unsupported key in ${keyFile}: use RSA or EC P-256 / P-384.`, 'config');
+  if (!spki.equals(certKey.export({ type: 'spki', format: 'der' }))) {
+    throw new VaultEnvError(`The private key in ${keyFile} does not belong to the certificate in ${certPath}.`, 'config');
+  }
+  return { key, alg, curve, x5t: b64url(crypto.createHash('sha256').update(der).digest()), notAfter: parsed.notAfter };
+}
+
+/** VAULT_ADDR normalised + /v1/auth/<mount>/login: the aud claim. */
+function audience(addr, mount) {
+  let url;
+  try {
+    url = new URL(String(addr).trim());
+  } catch (e) {
+    throw new VaultEnvError('VAULT_ADDR is not a valid URL.', 'config');
+  }
+  return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}/v1/auth/${mount}/login`;
+}
+
+// Header, claims and signature. A new iat and jti on every call.
+function signAssertion(cred, roleId, aud, nowSec) {
+  const iat = Math.floor(nowSec === undefined ? Date.now() / 1000 : nowSec);
+  const header = { alg: cred.alg, typ: 'JWT', 'x5t#S256': cred.x5t };
+  const claims = { iss: roleId, sub: roleId, aud, iat, exp: iat + ASSERTION_LIFETIME, jti: crypto.randomBytes(16).toString('hex') };
+  const input = `${b64url(Buffer.from(JSON.stringify(header), 'utf8'))}.${b64url(Buffer.from(JSON.stringify(claims), 'utf8'))}`;
+  const data = Buffer.from(input, 'ascii');
+  const sig = cred.curve ? crypto.sign(cred.curve.hash, data, { key: cred.key, dsaEncoding: 'ieee-p1363' }) : crypto.sign('sha256', data, cred.key);
+  return `${input}.${b64url(sig)}`;
+}
+
+function isoDate(sec) {
+  return new Date(sec * 1000).toISOString().slice(0, 10);
+}
+
+// Days left (rounded down), the warning (below 30 days, or expired) and check's text.
+function certificateStatus(notAfter, nowSec) {
+  const days = Math.floor((notAfter - nowSec) / 86400);
+  const date = isoDate(notAfter);
+  const expired = notAfter <= nowSec;
+  let warning = null;
+  if (expired) warning = `The client certificate expired on ${date}.`;
+  else if (days < CERT_WARN_DAYS) warning = `The client certificate expires in ${days} day(s), on ${date}. Replace it before then.`;
+  return { days, warning, text: expired ? `expired ${date}` : `expires ${date}, ${days} days` };
+}
+
+function certificateCheckLine(roleId, x5t, status, mount) {
+  return `auth     certificate (role_id ${String(roleId).slice(0, 8)}..., cert ${x5t.slice(0, 8)}..., ${status.text}, mount ${mount}; session revoked after reading)`;
+}
+
+/**
+ * A client assertion for auth/<mount>/login, for Vault clients that cannot sign
+ * one themselves (node-vault: vault.jwtLogin({ role, jwt })). Synchronous.
+ */
+function clientAssertion(o) {
+  o = o || {};
+  for (const k of ['roleId', 'certificatePath', 'vaultAddr']) {
+    if (!nonEmpty(o[k])) throw new VaultEnvError(`clientAssertion() needs ${k}.`, 'config');
+  }
+  const mount = nonEmpty(o.mount) || 'jwt';
+  if (!validMount(mount)) throw new VaultEnvError('The JWT mount must be a mount path such as jwt.', 'config');
+  const password = o.password === undefined || o.password === null || o.password === '' ? undefined : String(o.password);
+  const cred = loadClientCertificate(o.certificatePath.trim(), nonEmpty(o.keyPath), password);
+  return signAssertion(cred, o.roleId.trim(), audience(o.vaultAddr, mount));
+}
+
+// Unlike a secret ID, a certificate can log in any number of times, so every
+// failure that may pass is retried (connection, timeout, 429, 5xx), each time
+// with a new assertion. A session the server may have issued expires by itself.
+async function certificateLogin(cfg) {
+  const apiPath = `auth/${cfg.jwtMount}/login`;
+  const aud = audience(cfg.rawAddr, cfg.jwtMount);
+  let attempt = 0;
+  let res;
+  for (;;) {
+    let netErr;
+    res = undefined;
+    try {
+      res = await httpRequest(cfg, 'POST', apiPath, { role: cfg.roleId, jwt: signAssertion(cfg.credential, cfg.roleId, aud) }, { noToken: true });
+    } catch (e) {
+      netErr = e;
+    }
+    const again = res ? res.status === 429 || res.status >= 500 : true;
+    if (!again || attempt >= cfg.retries) {
+      if (netErr) {
+        const what = netErr.code === 'ETIMEDOUT' ? 'timed out' : `failed (${netErr.code || 'network error'})`;
+        throw new VaultEnvError(`Certificate login to Vault ${what}.`, 'unavailable');
+      }
+      break;
+    }
+    await sleep(cfg.retryDelayMs * Math.pow(2, attempt));
+    attempt += 1;
+  }
+  if (res.status === 400 || res.status === 401 || res.status === 403) {
+    throw new VaultEnvError(`Certificate login failed: the role ID or certificate is not accepted (mount ${cfg.jwtMount}).`, 'auth');
+  }
+  if (res.status !== 200) throw new VaultEnvError(`Vault answered HTTP ${res.status} to the certificate login.`, 'unavailable');
+  const token = res.body && res.body.auth && res.body.auth.client_token;
+  if (typeof token !== 'string' || !token) throw new VaultEnvError('Vault answered the certificate login without a token (unexpected response).', 'unavailable');
+  cfg.token = token;
 }
 
 // ---------------------------------------------------------------------------
@@ -628,8 +900,13 @@ function plan(values, env, override) {
 // Pipeline
 
 async function collect(cfg) {
-  if (cfg.auth !== 'approle') return collectWith(cfg);
-  await appRoleLogin(cfg);
+  if (cfg.auth === 'token') return collectWith(cfg);
+  if (cfg.auth === 'certificate') {
+    // Read and check the files first: a bad certificate fails before any request.
+    cfg.credential = loadClientCertificate(cfg.certificatePath, cfg.keyPath, cfg.password);
+    cfg.certificate = certificateStatus(cfg.credential.notAfter, Date.now() / 1000);
+    await certificateLogin(cfg);
+  } else await appRoleLogin(cfg);
   try {
     return await collectWith(cfg);
   } finally {
@@ -640,9 +917,10 @@ async function collect(cfg) {
 async function collectWith(cfg) {
   const warnings = (cfg.notes || []).slice();
   if (cfg.insecureHttp) warnings.push('VAULT_ADDR uses plain http: the token and every secret cross the network unencrypted.');
+  if (cfg.certificate && cfg.certificate.warning) warnings.push(cfg.certificate.warning);
   const self = await lookupSelf(cfg);
   // An AppRole session is short-lived by design: its TTL is no reason to warn.
-  if (cfg.auth !== 'approle' && self && !self.denied && self.ttl > 0 && self.ttl < TTL_WARN_SECONDS) {
+  if (cfg.auth === 'token' && self && !self.denied && self.ttl > 0 && self.ttl < TTL_WARN_SECONDS) {
     warnings.push(`The token expires in ${Math.max(1, Math.round(self.ttl / 86400))} day(s). Issue a new one before then.`);
   }
   const baseInfo = resolveBase(cfg, self);
@@ -770,7 +1048,7 @@ function loadSync(options) {
 
 function serializableOptions(options, cfg) {
   const o = {};
-  for (const k of ['addr', 'imports', 'base', 'tokenFile', 'namespace', 'cacert', 'capath', 'timeout', 'retries', 'retryDelayMs', 'caseInsensitive', 'allowHttp', 'approleMount']) {
+  for (const k of ['addr', 'imports', 'base', 'tokenFile', 'namespace', 'cacert', 'capath', 'timeout', 'retries', 'retryDelayMs', 'caseInsensitive', 'allowHttp', 'approleMount', 'jwtMount']) {
     if (options && options[k] !== undefined) o[k] = options[k];
   }
   // Credentials travel in the child's environment, never in argv. With AppRole
@@ -778,6 +1056,11 @@ function serializableOptions(options, cfg) {
   if (cfg.auth === 'approle') {
     o.roleId = cfg.roleId;
     if (cfg.secretId) o.secretId = cfg.secretId;
+  } else if (cfg.auth === 'certificate') {
+    o.roleId = cfg.roleId;
+    o.clientCertificatePath = cfg.certificatePath;
+    if (cfg.keyPath) o.clientKeyPath = cfg.keyPath;
+    if (cfg.password !== undefined) o.clientCertificatePassword = cfg.password;
   } else o.token = cfg.token;
   return o;
 }
@@ -813,16 +1096,23 @@ Options (each also has an environment variable):
   --role-id-file <path> VAULT_ROLE_ID_FILE      AppRole, when no token is set (or VAULT_ROLE_ID)
   --secret-id-file <path> VAULT_SECRET_ID_FILE  (the secret ID itself only via VAULT_SECRET_ID)
   --approle-mount <path> VAULT_ENV_APPROLE_MOUNT default approle
+  --client-certificate-path <path>
+                        VAULT_CLIENT_CERTIFICATE_PATH  certificate login with the role ID (one PEM file: key and certificate)
+  --client-key-path <path>
+                        VAULT_CLIENT_KEY_PATH   the key, when it is in a file of its own
+  --jwt-mount <path>    VAULT_ENV_JWT_MOUNT     default jwt
   --import <spec>       VAULT_ENV_IMPORT        repeatable; comma-separated in the variable
   --base <path>         VAULT_ENV_BASE          base for relative imports
   --override            VAULT_ENV_OVERRIDE      replace variables that are already set
-  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN (or the AppRole variables) on to the command
+  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN (or the AppRole / certificate variables) on to the command
   --timeout <seconds>   VAULT_ENV_TIMEOUT       per request, default 10
   --retries <n>         VAULT_ENV_RETRIES       default 3
 
 Environment only:
   VAULT_ENV_ENABLED     false: load nothing, remove the credentials, run the command
                         true: fail unless VAULT_ADDR and VAULT_ENV_IMPORT are set
+  VAULT_CLIENT_CERTIFICATE_PASSWORD / VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE
+                        the password of an encrypted private key
 
 Import spec:  [optional:]vault://<mount>/<path> | <relative path> | vault://   [?prefix=X_&name=auto|verbatim|upper&kv=1|2]
 Docs: https://github.com/kaylovh/vault-env-loader
@@ -847,6 +1137,9 @@ function parseArgs(argv) {
     else if (a === '--role-id-file') opts.roleIdFile = val();
     else if (a === '--secret-id-file') opts.secretIdFile = val();
     else if (a === '--approle-mount') opts.approleMount = val();
+    else if (a === '--client-certificate-path') opts.clientCertificatePath = val();
+    else if (a === '--client-key-path') opts.clientKeyPath = val();
+    else if (a === '--jwt-mount') opts.jwtMount = val();
     else if (a === '--import') imports.push(...splitList(val()));
     else if (a === '--base') opts.base = val();
     else if (a === '--override') opts.override = true;
@@ -855,6 +1148,7 @@ function parseArgs(argv) {
     else if (a === '--retries') opts.retries = val();
     else if (a === '--token') throw new VaultEnvError('There is no --token option: command-line arguments are visible to every user (ps). Use VAULT_TOKEN or --token-file.', 'config');
     else if (a === '--secret-id') throw new VaultEnvError('There is no --secret-id option: command-line arguments are visible to every user (ps). Use VAULT_SECRET_ID or --secret-id-file.', 'config');
+    else if (a === '--client-certificate-password') throw new VaultEnvError('There is no --client-certificate-password option: command-line arguments are visible to every user (ps). Use VAULT_CLIENT_CERTIFICATE_PASSWORD or VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE.', 'config');
     else if (a === 'check' && sub === null) sub = 'check';
     else if (a === '--version' || a === '-v') sub = 'version';
     else if (a === '--help' || a === '-h') sub = 'help';
@@ -880,6 +1174,7 @@ async function check(opts) {
   lines.push(`vault-env-loader ${VERSION}`);
   lines.push(`addr     ${cfg.addr}`);
   if (cfg.auth === 'approle') lines.push(`auth     approle (role_id ${String(cfg.roleId).slice(0, 8)}..., mount ${cfg.approleMount}; session revoked after reading)`);
+  if (cfg.auth === 'certificate') lines.push(certificateCheckLine(cfg.roleId, cfg.credential.x5t, cfg.certificate, cfg.jwtMount));
   if (r.token) {
     const meta = Object.keys(r.token.meta).map((k) => `${k}=${r.token.meta[k]}`).join(' ');
     lines.push(`token    ${r.token.ttl ? `expires in ${Math.round(r.token.ttl / 3600)}h` : 'no expiry'}${meta ? `, ${meta}` : ''}`);
@@ -978,10 +1273,11 @@ module.exports = {
   load,
   loadSync,
   fetch: fetchValues,
+  clientAssertion,
   VaultEnvError,
   VERSION,
   // Exposed for tests; not part of the public API.
-  _internal: { readConfig, stripCredentials, parseImport, envName, mapEntries, mergeImports, plan, aliasFailures, retryable, parseArgs, main },
+  _internal: { readConfig, stripCredentials, parseImport, envName, mapEntries, mergeImports, plan, aliasFailures, retryable, parseArgs, main, loadClientCertificate, parseCertificateDer, audience, signAssertion, certificateStatus, certificateCheckLine },
 };
 
 if (require.main === module) {

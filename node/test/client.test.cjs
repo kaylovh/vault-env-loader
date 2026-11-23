@@ -657,6 +657,260 @@ test('AppRole: another mount', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Certificate login (0.4)
+
+const FIXTURES = path.join(__dirname, '..', '..', 'spec', 'fixtures');
+const RSA_PEM = path.join(FIXTURES, 'rsa.pem');
+const P256_PEM = path.join(FIXTURES, 'p256.pem');
+const RSA_X5T = 'TRPxIPG0IpPpJQ7BRpygD3zOwAQ5JyYr2uVlTklRjyk';
+const certOf = (file) => /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(fs.readFileSync(file, 'utf8'))[0];
+const JWT_ROLE = { role: 'role-123', certificate: certOf(RSA_PEM) };
+const CERT_LOGIN_FAILED = 'Certificate login failed: the role ID or certificate is not accepted (mount jwt).';
+
+function certEnv(addr, extra) {
+  const env = childEnv(addr, Object.assign({ VAULT_ROLE_ID: 'role-123', VAULT_CLIENT_CERTIFICATE_PATH: RSA_PEM }, extra));
+  delete env.VAULT_TOKEN;
+  return env;
+}
+
+const logins = (reqs) => reqs.filter((r) => r.path === 'auth/jwt/login');
+
+test('certificate: sign, log in, read with the session, revoke it', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: JWT_ROLE });
+  try {
+    const env = certEnv(v.addr);
+    const started = Math.floor(Date.now() / 1000);
+    const { value, stderr } = await captureStderr(() => lib.load(Object.assign({ env }, FAST)));
+    assert.deepEqual(value, ['DB_PASSWORD']);
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.equal(env.VAULT_ROLE_ID, undefined);
+    assert.equal(env.VAULT_CLIENT_CERTIFICATE_PATH, undefined);
+    assert.equal(env.VAULT_TOKEN, undefined);
+    assert.ok(fs.existsSync(RSA_PEM), 'the file itself is never touched');
+    assert.equal(stderr, '', 'no warning for a certificate that is valid for years');
+    const reqs = await v.requests();
+    assert.deepEqual(reqs.map((r) => `${r.method} ${r.path}`), [
+      'POST auth/jwt/login',
+      'GET auth/token/lookup-self',
+      'GET sys/internal/ui/mounts/secret/order-service/prod/database',
+      'GET secret/data/order-service/prod/database',
+      'POST auth/token/revoke-self',
+    ]);
+    assert.equal(reqs[0].token, null);
+    assert.deepEqual(Object.keys(reqs[0].body), ['role', 'jwt', 'assertion']);
+    const { header, claims } = reqs[0].body.assertion;
+    assert.deepEqual(header, { alg: 'RS256', typ: 'JWT', 'x5t#S256': RSA_X5T });
+    assert.equal(claims.aud, `${v.addr}/v1/auth/jwt/login`);
+    assert.ok(claims.iat >= started && claims.exp === claims.iat + 120);
+    assert.ok(reqs.slice(1).every((r) => r.token === TOKEN));
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: EC P-256, a separate key file and another mount', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: { role: 'role-123', certificate: certOf(P256_PEM), mount: 'ci/jwt' } });
+  try {
+    const env = certEnv(v.addr, { VAULT_CLIENT_CERTIFICATE_PATH: path.join(FIXTURES, 'p256.pem'), VAULT_CLIENT_KEY_PATH: P256_PEM, VAULT_ENV_JWT_MOUNT: 'ci/jwt' });
+    await lib.load(Object.assign({ env }, FAST));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.equal(env.VAULT_CLIENT_KEY_PATH, undefined);
+    const login = (await v.requests())[0];
+    assert.equal(login.path, 'auth/ci/jwt/login');
+    assert.equal(login.body.assertion.header.alg, 'ES256');
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: a refused login fails once with exit 78, without the server text', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: Object.assign({}, JWT_ROLE, { role: 'another-role' }) });
+  try {
+    const out = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', 'process.exit(0)'], { env: certEnv(v.addr) });
+    assert.equal(out.status, 78);
+    assert.equal(String(out.stderr), `[vault-env-loader] ${CERT_LOGIN_FAILED}\n`);
+    assert.deepEqual((await v.requests()).map((r) => r.path), ['auth/jwt/login']);
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: a bad certificate fails before any request', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: JWT_ROLE });
+  try {
+    const missing = path.join(tmp, 'no-such.pem');
+    const out = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', 'process.exit(0)'], { env: certEnv(v.addr, { VAULT_CLIENT_CERTIFICATE_PATH: missing }) });
+    assert.equal(out.status, 78);
+    assert.equal(String(out.stderr), `[vault-env-loader] Cannot read the client certificate file (${missing}): ENOENT.\n`);
+    const enc = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', 'process.exit(0)'], { env: certEnv(v.addr, { VAULT_CLIENT_CERTIFICATE_PATH: path.join(FIXTURES, 'encrypted.pem'), VAULT_CLIENT_CERTIFICATE_PASSWORD: 'wrong' }) });
+    assert.equal(enc.status, 78);
+    assert.match(String(enc.stderr), /wrong password/);
+    assert.ok(!String(enc.stderr).includes('BEGIN'), 'no file contents in messages');
+    assert.deepEqual(await v.requests(), []);
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: 503 and timeouts are retried, each time with a new assertion', async () => {
+  const v = await fake(Object.assign({}, APPROLE_ROUTES, { 'auth/jwt/login': [{ status: 503, body: { errors: [] } }, { hang: true }, { status: 500, body: { errors: [] } }, { verify: true }] }), { jwt: JWT_ROLE });
+  try {
+    const env = certEnv(v.addr, { VAULT_ENV_TIMEOUT: '0.3' });
+    await lib.load(Object.assign({ env }, FAST));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    const jtis = logins(await v.requests()).map((r) => r.body.assertion.claims.jti);
+    assert.equal(jtis.length, 4);
+    assert.equal(new Set(jtis).size, 4, 'a new jti for every attempt');
+  } finally {
+    v.stop();
+  }
+  const down = await fake(Object.assign({}, APPROLE_ROUTES, { 'auth/jwt/login': { status: 502, body: { errors: [] } } }), { jwt: JWT_ROLE });
+  try {
+    await rejectsCode(lib.load(Object.assign({ env: certEnv(down.addr, { VAULT_ENV_RETRIES: '2' }) }, FAST)), 'unavailable');
+    assert.equal(logins(await down.requests()).length, 3, 'bounded by VAULT_ENV_RETRIES');
+  } finally {
+    down.stop();
+  }
+});
+
+test('certificate: the CLI wrapper removes only the variables it used; the files stay', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: { role: 'role-123', certificate: certOf(path.join(FIXTURES, 'encrypted.pem')) } });
+  try {
+    const pw = path.join(tmp, 'cert-password');
+    fs.writeFileSync(pw, 'fixture-password\n');
+    const roleFile = path.join(tmp, 'unused-role-id-2');
+    fs.writeFileSync(roleFile, 'other');
+    const names = ['DB_PASSWORD', 'VAULT_ROLE_ID', 'VAULT_ROLE_ID_FILE', 'VAULT_CLIENT_CERTIFICATE_PATH', 'VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE', 'VAULT_ENV_JWT_MOUNT', 'VAULT_TOKEN'];
+    const print = `process.stdout.write(JSON.stringify(Object.fromEntries(${JSON.stringify(names)}.map((k) => [k, process.env[k] || null]))))`;
+    const env = certEnv(v.addr, { VAULT_CLIENT_CERTIFICATE_PATH: path.join(FIXTURES, 'encrypted.pem'), VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE: pw, VAULT_ROLE_ID_FILE: roleFile, VAULT_ENV_JWT_MOUNT: 'jwt' });
+    const out = spawnSync(process.execPath, [INDEX, '--', process.execPath, '-e', print], { env });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.deepEqual(JSON.parse(out.stdout), {
+      DB_PASSWORD: 's3cr3t', VAULT_ROLE_ID: null, VAULT_ROLE_ID_FILE: roleFile, VAULT_CLIENT_CERTIFICATE_PATH: null,
+      VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE: null, VAULT_ENV_JWT_MOUNT: 'jwt', VAULT_TOKEN: null,
+    });
+    assert.ok(fs.existsSync(pw));
+    assert.equal((await v.requests()).pop().path, 'auth/token/revoke-self', 'revoked before the command ran');
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: --keep-token leaves the variables for the application', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: JWT_ROLE });
+  try {
+    const out = spawnSync(process.execPath, [INDEX, '--keep-token', '--', process.execPath, '-e', 'process.stdout.write(process.env.VAULT_CLIENT_CERTIFICATE_PATH + "|" + (process.env.VAULT_TOKEN || ""))'], { env: certEnv(v.addr) });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.equal(String(out.stdout), `${RSA_PEM}|`, 'the session token never reaches the command');
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: a secret ID beside the certificate is a configuration error, no request', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: JWT_ROLE });
+  try {
+    const out = spawnSync(process.execPath, [INDEX, '--', 'true'], { env: certEnv(v.addr, { VAULT_SECRET_ID: 's' }) });
+    assert.equal(out.status, 78);
+    assert.match(String(out.stderr), /AppRole login takes one or the other/);
+    assert.deepEqual(await v.requests(), []);
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: the command-line flags, and no flag for the password', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: Object.assign({ mount: 'ci/jwt' }, JWT_ROLE) });
+  try {
+    const env = certEnv(v.addr);
+    delete env.VAULT_CLIENT_CERTIFICATE_PATH;
+    const out = spawnSync(process.execPath, [INDEX, '--client-certificate-path', RSA_PEM, '--client-key-path', RSA_PEM, '--jwt-mount', 'ci/jwt', '--', process.execPath, '-e', 'process.stdout.write(process.env.DB_PASSWORD)'], { env });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.equal(String(out.stdout), 's3cr3t');
+  } finally {
+    v.stop();
+  }
+  const bad = spawnSync(process.execPath, [INDEX, '--client-certificate-password', 'x', '--', 'true'], { env: {} });
+  assert.equal(bad.status, 78);
+  assert.match(String(bad.stderr), /no --client-certificate-password option/);
+});
+
+test('certificate: loadSync() logs in inside the worker; the session never reaches the parent', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: JWT_ROLE });
+  try {
+    const print = 'process.stdout.write(JSON.stringify({ DB_PASSWORD: process.env.DB_PASSWORD, T: process.env.VAULT_TOKEN || null, C: process.env.VAULT_CLIENT_CERTIFICATE_PATH || null }))';
+    const out = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(INDEX)}).loadSync(); ${print}`], { env: certEnv(v.addr) });
+    assert.equal(out.status, 0, String(out.stderr));
+    assert.deepEqual(JSON.parse(out.stdout), { DB_PASSWORD: 's3cr3t', T: null, C: null });
+    assert.equal((await v.requests()).pop().path, 'auth/token/revoke-self');
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: check names the method, the certificate and its expiry, and revokes', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: JWT_ROLE });
+  try {
+    const out = spawnSync(process.execPath, [INDEX, 'check'], { env: certEnv(v.addr) });
+    assert.equal(out.status, 0, String(out.stderr));
+    const days = Math.floor((Date.parse('2060-01-01T00:00:00Z') / 1000 - Date.now() / 1000) / 86400);
+    assert.ok(String(out.stdout).includes(`auth     certificate (role_id role-123..., cert TRPxIPG0..., expires 2060-01-01, ${days} days, mount jwt; session revoked after reading)\n`), String(out.stdout));
+    assert.equal(String(out.stderr), '');
+    assert.equal((await v.requests()).pop().path, 'auth/token/revoke-self');
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: a failed revoke only warns', async () => {
+  const v = await fake(Object.assign({}, APPROLE_ROUTES, { 'auth/token/revoke-self': { status: 500, body: { errors: [] } } }), { jwt: JWT_ROLE });
+  try {
+    const env = certEnv(v.addr);
+    const { stderr } = await captureStderr(() => lib.load(Object.assign({ env }, FAST)));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.equal(stderr, '[vault-env-loader] Could not revoke the certificate login session (HTTP 500); it expires by itself.\n');
+  } finally {
+    v.stop();
+  }
+});
+
+test('certificate: a token wins and the certificate variables are left alone', async () => {
+  const v = await fake(ROUTES);
+  try {
+    const env = childEnv(v.addr, { VAULT_ROLE_ID: 'r', VAULT_CLIENT_CERTIFICATE_PATH: RSA_PEM });
+    const { stderr } = await captureStderr(() => lib.load(Object.assign({ env }, FAST)));
+    assert.equal(env.DB_PASSWORD, 's3cr3t');
+    assert.equal(env.VAULT_CLIENT_CERTIFICATE_PATH, RSA_PEM);
+    assert.equal(stderr, '[vault-env-loader] VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID / VAULT_CLIENT_CERTIFICATE_PATH are ignored.\n');
+  } finally {
+    v.stop();
+  }
+});
+
+test('clientAssertion(): a JWT that a Vault JWT role accepts', async () => {
+  const v = await fake(APPROLE_ROUTES, { jwt: JWT_ROLE });
+  try {
+    const jwt = lib.clientAssertion({ roleId: 'role-123', certificatePath: RSA_PEM, vaultAddr: `${v.addr}/` });
+    assert.equal(typeof jwt, 'string');
+    const res = await new Promise((resolve) => {
+      const req = require('http').request(`${v.addr}/v1/auth/jwt/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' } }, (r) => {
+        r.resume();
+        r.on('end', () => resolve(r.statusCode));
+      });
+      req.end(JSON.stringify({ role: 'role-123', jwt }));
+    });
+    assert.equal(res, 200);
+  } finally {
+    v.stop();
+  }
+  assert.throws(() => lib.clientAssertion({ certificatePath: RSA_PEM, vaultAddr: 'https://v.example.com' }), (e) => e instanceof lib.VaultEnvError && /needs roleId/.test(e.message));
+  assert.throws(() => lib.clientAssertion({ roleId: 'r', certificatePath: path.join(FIXTURES, 'encrypted.pem'), vaultAddr: 'https://v.example.com' }), (e) => e.code === 'config' && /is encrypted/.test(e.message));
+  const jwt = lib.clientAssertion({ roleId: 'r', certificatePath: path.join(FIXTURES, 'encrypted.pem'), password: 'fixture-password', vaultAddr: 'https://V.example.com:443', mount: 'ci/jwt' });
+  const claims = JSON.parse(Buffer.from(jwt.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64'));
+  assert.equal(claims.aud, 'https://v.example.com/v1/auth/ci/jwt/login');
+});
+
+// ---------------------------------------------------------------------------
 // VAULT_ENV_ENABLED
 
 const LINE = (m) => `[vault-env-loader] ${m}\n`;

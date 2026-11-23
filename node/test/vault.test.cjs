@@ -7,7 +7,13 @@ const assert = require('node:assert/strict');
 const http = require('http');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const fs = require('fs');
+const crypto = require('crypto');
 const lib = require('../index.cjs');
+
+const FIXTURES = path.join(__dirname, '..', '..', 'spec', 'fixtures');
+const certOf = (f) => /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(fs.readFileSync(path.join(FIXTURES, f), 'utf8'))[0];
+const CERT_ROLE = 'vel-cert';
 
 const ADDR = process.env.VAULT_IT_ADDR;
 const ROOT = process.env.VAULT_IT_ROOT_TOKEN;
@@ -53,6 +59,16 @@ test.before(async () => {
   roleId = (await api('GET', 'auth/approle/role/vel/role-id')).body.data.role_id;
   secretId = (await api('POST', 'auth/approle/role/vel/secret-id', {})).body.data.secret_id;
   onceSecretId = (await api('POST', 'auth/approle/role/vel/secret-id', { num_uses: 1 })).body.data.secret_id;
+  // Certificate login (0.4): a plain Vault JWT role that trusts the fixtures' public keys.
+  // vault-env-loader sends the role ID as `role`, so the JWT role is named after it.
+  await api('POST', 'sys/auth/jwt', { type: 'jwt' }); // 400 if enabled: fine
+  const pubkeys = ['rsa.pem', 'p256.pem', 'p384-cert.pem'].map((f) => crypto.createPublicKey(certOf(f)).export({ type: 'spki', format: 'pem' }));
+  const cfg = await api('POST', 'auth/jwt/config', { jwt_validation_pubkeys: pubkeys, jwt_supported_algs: ['RS256', 'ES256', 'ES384'] });
+  assert.ok(cfg.status < 300, JSON.stringify(cfg.body));
+  const role = await api('POST', `auth/jwt/role/${CERT_ROLE}`, {
+    role_type: 'jwt', user_claim: 'sub', bound_subject: CERT_ROLE, bound_audiences: [`${ADDR.replace(/\/+$/, '')}/v1/auth/jwt/login`], token_policies: ['vel-reader'], token_ttl: '10m',
+  });
+  assert.ok(role.status < 300, JSON.stringify(role.body));
 });
 
 const env = (extra) => Object.assign({ VAULT_ADDR: ADDR, VAULT_TOKEN: reader }, extra);
@@ -112,4 +128,41 @@ test('AppRole: CLI wrapper end to end, credentials stripped', { skip }, () => {
   });
   assert.equal(out.status, 0, String(out.stderr));
   assert.equal(String(out.stdout), 's3cr3t|||');
+});
+
+const certEnv = (extra) => Object.assign({ VAULT_ADDR: ADDR, VAULT_ROLE_ID: CERT_ROLE, VAULT_CLIENT_CERTIFICATE_PATH: path.join(FIXTURES, 'rsa.pem'), VAULT_ENV_BASE: 'secret/app/prod' }, extra);
+
+test('certificate login against real Vault (RS256, ES256, ES384)', { skip }, async () => {
+  for (const extra of [{}, { VAULT_CLIENT_CERTIFICATE_PATH: path.join(FIXTURES, 'p256.pem') }, { VAULT_CLIENT_CERTIFICATE_PATH: path.join(FIXTURES, 'p384-cert.pem'), VAULT_CLIENT_KEY_PATH: path.join(FIXTURES, 'p384-key.pem') }]) {
+    const values = await lib.fetch({ env: certEnv(Object.assign({ VAULT_ENV_IMPORT: 'db' }, extra)), retryDelayMs: 1 });
+    assert.deepEqual(values, { DB_PASSWORD: 's3cr3t', DB_USER: 'app' }, JSON.stringify(extra));
+  }
+});
+
+test('certificate: another role is refused', { skip }, async () => {
+  await assert.rejects(lib.fetch({ env: certEnv({ VAULT_ROLE_ID: 'nosuch', VAULT_ENV_IMPORT: 'db' }), retryDelayMs: 1 }), (e) => e.code === 'auth');
+});
+
+test('certificate: a certificate Vault does not trust is refused', { skip }, async () => {
+  await assert.rejects(lib.fetch({ env: certEnv({ VAULT_CLIENT_CERTIFICATE_PATH: path.join(FIXTURES, 'encrypted.pem'), VAULT_CLIENT_CERTIFICATE_PASSWORD: 'fixture-password', VAULT_ENV_IMPORT: 'db' }), retryDelayMs: 1 }), (e) => e.code === 'auth');
+});
+
+test('certificate: CLI wrapper end to end, credentials stripped, session revoked', { skip }, () => {
+  const print = 'process.stdout.write([process.env.DB_PASSWORD, process.env.VAULT_ROLE_ID || "", process.env.VAULT_CLIENT_CERTIFICATE_PATH || "", process.env.VAULT_TOKEN || ""].join("|"))';
+  const base = Object.assign({}, process.env);
+  delete base.VAULT_TOKEN;
+  const out = spawnSync(process.execPath, [path.join(__dirname, '..', 'index.cjs'), '--', process.execPath, '-e', print], {
+    env: Object.assign(base, certEnv({ VAULT_ENV_IMPORT: 'db' })),
+  });
+  assert.equal(out.status, 0, String(out.stderr));
+  assert.equal(String(out.stdout), 's3cr3t|||');
+});
+
+test('certificate: clientAssertion() works with a plain Vault JWT role', { skip }, async () => {
+  const jwt = lib.clientAssertion({ roleId: CERT_ROLE, certificatePath: path.join(FIXTURES, 'p256.pem'), vaultAddr: ADDR });
+  const res = await api('POST', 'auth/jwt/login', { role: CERT_ROLE, jwt }, '');
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const token = res.body.auth.client_token;
+  assert.equal((await api('GET', 'secret/data/app/prod/db', undefined, token)).status, 200);
+  assert.equal((await api('POST', 'auth/token/revoke-self', undefined, token)).status, 204);
 });

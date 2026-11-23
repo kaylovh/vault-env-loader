@@ -15,6 +15,19 @@ export interface Options {
   secretIdFile?: string;
   /** AppRole auth mount. Default: VAULT_ENV_APPROLE_MOUNT, else "approle". */
   approleMount?: string;
+  /**
+   * Certificate login, used when there is no token and no secret ID: with roleId, sign a
+   * short-lived JWT with the private key and log in at auth/<jwtMount>/login. One PEM file
+   * with the key and the certificate. Default: VAULT_CLIENT_CERTIFICATE_PATH.
+   */
+  clientCertificatePath?: string;
+  /** The private key, when it is in a file of its own. Default: VAULT_CLIENT_KEY_PATH. */
+  clientKeyPath?: string;
+  /** Password of an encrypted key. Default: VAULT_CLIENT_CERTIFICATE_PASSWORD, else the contents of ..._PASSWORD_FILE. */
+  clientCertificatePassword?: string;
+  clientCertificatePasswordFile?: string;
+  /** JWT auth mount for certificate login. Default: VAULT_ENV_JWT_MOUNT, else "jwt". */
+  jwtMount?: string;
   /** Imports, e.g. ["vault://secret/app/prod/db", "redis?prefix=REDIS_"]. Default: VAULT_ENV_IMPORT. */
   imports?: string[] | string;
   /** Base path for relative imports. Default: VAULT_ENV_BASE, else token metadata application/environment. */
@@ -25,7 +38,7 @@ export interface Options {
   capath?: string;
   /** Replace variables that are already set. Default: VAULT_ENV_OVERRIDE, false. */
   override?: boolean;
-  /** Leave VAULT_TOKEN (or the AppRole variables) in the environment after loading. Default: false. */
+  /** Leave VAULT_TOKEN (or the AppRole / certificate variables) in the environment after loading. Default: false. */
   keepToken?: boolean;
   /** Seconds per request. Default 10. */
   timeout?: number;
@@ -43,6 +56,27 @@ export function load(options?: Options): Promise<string[]>;
 export function loadSync(options?: Options): string[];
 /** Read secrets and return { NAME: value } without touching the environment. */
 export function fetch(options?: Options): Promise<Record<string, string>>;
+
+export interface ClientAssertionOptions {
+  /** The role: iss and sub of the assertion. */
+  roleId: string;
+  /** PEM file with the certificate and, unless keyPath is given, the private key. */
+  certificatePath: string;
+  keyPath?: string;
+  /** Password of an encrypted private key. */
+  password?: string;
+  /** The Vault address the assertion is for (its aud is <vaultAddr>/v1/auth/<mount>/login). */
+  vaultAddr: string;
+  /** JWT auth mount. Default "jwt". */
+  mount?: string;
+}
+
+/**
+ * A client assertion (a JWT signed with the certificate's private key, valid 120 s, with a
+ * new jti) for POST auth/<mount>/login { role, jwt }, e.g. node-vault's jwtLogin().
+ * Synchronous; throws VaultEnvError (code "config") for an unreadable or unsuitable file.
+ */
+export function clientAssertion(options: ClientAssertionOptions): string;
 
 export class VaultEnvError extends Error {
   name: 'VaultEnvError';

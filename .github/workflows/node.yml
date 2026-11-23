@@ -31,7 +31,8 @@ jobs:
       - run: node test/smoke.cjs
 
   legacy:
-    # node:test does not exist before 18: smoke-test the three entry points only.
+    # node:test does not exist before 18: smoke-test the three entry points, and
+    # certificate login (RSA, P-256, P-384, encrypted key) signed without X509Certificate.
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +55,8 @@ jobs:
       - run: node --test test/spec.test.cjs test/client.test.cjs
 
   vault:
-    # Against a real HashiCorp Vault dev server (KV v1 and v2, policies, token metadata).
+    # Against a real HashiCorp Vault dev server (KV v1 and v2, policies, token metadata,
+    # AppRole, and certificate login through a JWT role with jwt_validation_pubkeys).
     runs-on: ubuntu-latest
     services:
       vault:
