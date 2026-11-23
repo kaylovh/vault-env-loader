@@ -24,6 +24,10 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 
+[project.optional-dependencies]
+# Certificate login (VAULT_CLIENT_CERTIFICATE_PATH) and client_assertion(). The base package stays dependency-free.
+cert = ["cryptography>=3.4"]
+
 [project.urls]
 Homepage = "https://github.com/kaylovh/vault-env-loader/tree/main/python#readme"
 Source = "https://github.com/kaylovh/vault-env-loader"

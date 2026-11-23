@@ -4,6 +4,7 @@ VAULT_IT_ROOT_TOKEN are set (CI starts hashicorp/vault as a service):
     VAULT_IT_ADDR=http://127.0.0.1:8200 VAULT_IT_ROOT_TOKEN=root python -m unittest tests/test_vault.py
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -112,6 +113,76 @@ class RealVault(unittest.TestCase):
         out = subprocess.check_output([sys.executable, MODULE, 'check'], env=env).decode()
         self.assertIn('secret/app/prod/db', out)
         self.assertNotIn('s3cr3t', out)
+
+
+FIXTURES = os.path.join(HERE, '..', '..', 'spec', 'fixtures')
+CERT_ROLE = 'vel-cert'
+HAVE_CRYPTOGRAPHY = importlib.util.find_spec('cryptography') is not None
+
+
+@unittest.skipUnless(ADDR and ROOT and HAVE_CRYPTOGRAPHY, 'VAULT_IT_ADDR / VAULT_IT_ROOT_TOKEN not set, or no cryptography')
+class RealVaultCertificate(unittest.TestCase):
+    """Certificate login (0.4) against a plain Vault JWT role that trusts the fixtures'
+    public keys. vault-env-loader sends the role ID as `role`, so the role is named after it."""
+
+    @classmethod
+    def setUpClass(cls):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        api('POST', 'secret/data/app/prod/db', {'data': {'db.password': 's3cr3t', 'DB_USER': 'app'}})
+        api('PUT', 'sys/policies/acl/vel-cert-reader', {'policy': 'path "secret/data/app/prod/*" { capabilities = ["read"] }\n'
+                                                             'path "sys/internal/ui/mounts/*" { capabilities = ["read"] }'})
+        api('POST', 'sys/auth/jwt', {'type': 'jwt'})  # 400 if already enabled: fine
+        keys = []
+        for f in ('rsa.pem', 'p256.pem', 'p384-cert.pem'):
+            with open(os.path.join(FIXTURES, f), 'rb') as fh:
+                pem = fh.read()
+            cert = x509.load_pem_x509_certificate(pem[pem.index(b'-----BEGIN CERTIFICATE-----'):])
+            keys.append(cert.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode())
+        code, _ = api('POST', 'auth/jwt/config', {'jwt_validation_pubkeys': keys, 'jwt_supported_algs': ['RS256', 'ES256', 'ES384']})
+        assert code < 300, code
+        code, _ = api('POST', 'auth/jwt/role/%s' % CERT_ROLE, {
+            'role_type': 'jwt', 'user_claim': 'sub', 'bound_subject': CERT_ROLE, 'bound_audiences': ['%s/v1/auth/jwt/login' % ADDR.rstrip('/')],
+            'token_policies': ['vel-cert-reader'], 'token_ttl': '10m'})
+        assert code < 300, code
+
+    def cert_env(self, **extra):
+        e = {'VAULT_ADDR': ADDR, 'VAULT_ROLE_ID': CERT_ROLE, 'VAULT_CLIENT_CERTIFICATE_PATH': os.path.join(FIXTURES, 'rsa.pem'),
+             'VAULT_ENV_BASE': 'secret/app/prod', 'VAULT_ENV_IMPORT': 'db'}
+        e.update(extra)
+        return e
+
+    def test_rs256_es256_es384(self):
+        for extra in ({}, {'VAULT_CLIENT_CERTIFICATE_PATH': os.path.join(FIXTURES, 'p256.pem')},
+                      {'VAULT_CLIENT_CERTIFICATE_PATH': os.path.join(FIXTURES, 'p384-cert.pem'), 'VAULT_CLIENT_KEY_PATH': os.path.join(FIXTURES, 'p384-key.pem')}):
+            self.assertEqual(V.fetch(env=self.cert_env(**extra), retry_delay=0.001), {'DB_PASSWORD': 's3cr3t', 'DB_USER': 'app'}, extra)
+
+    def test_another_role_is_refused(self):
+        with self.assertRaises(V.VaultEnvError) as cm:
+            V.fetch(env=self.cert_env(VAULT_ROLE_ID='nosuch'), retry_delay=0.001)
+        self.assertEqual(cm.exception.code, 'auth')
+
+    def test_untrusted_certificate_is_refused(self):
+        with self.assertRaises(V.VaultEnvError) as cm:
+            V.fetch(env=self.cert_env(VAULT_CLIENT_CERTIFICATE_PATH=os.path.join(FIXTURES, 'encrypted.pem'),
+                                      VAULT_CLIENT_CERTIFICATE_PASSWORD='fixture-password'), retry_delay=0.001)
+        self.assertEqual(cm.exception.code, 'auth')
+
+    def test_cli_wrapper_strips_credentials(self):
+        env = dict(os.environ, **self.cert_env())
+        env.pop('VAULT_TOKEN', None)
+        out = subprocess.check_output([sys.executable, MODULE, '--', sys.executable, '-c',
+                                       'import os; print("|".join(os.environ.get(k, "") for k in '
+                                       '("DB_PASSWORD", "VAULT_ROLE_ID", "VAULT_CLIENT_CERTIFICATE_PATH", "VAULT_TOKEN")))'], env=env)
+        self.assertEqual(out.decode().strip(), 's3cr3t|||')
+
+    def test_client_assertion_with_a_plain_jwt_role(self):
+        jwt = V.client_assertion(role_id=CERT_ROLE, certificate_path=os.path.join(FIXTURES, 'p256.pem'), vault_addr=ADDR)
+        code, body = api('POST', 'auth/jwt/login', {'role': CERT_ROLE, 'jwt': jwt})
+        self.assertEqual(code, 200)
+        token = body['auth']['client_token']
+        self.assertEqual(api('GET', 'secret/data/app/prod/db', token=token)[0], 200)
+        self.assertEqual(api('POST', 'auth/token/revoke-self', token=token)[0], 204)
 
 
 if __name__ == '__main__':

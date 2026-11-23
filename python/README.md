@@ -6,7 +6,7 @@ Load secrets from HashiCorp Vault's KV engine into environment variables **befor
 - **Fails fast.** If a secret cannot be loaded, your application does not start (exit code 78), instead of failing later in business code.
 - **Imports like Spring Cloud Vault.** `vault://secret/my-app/prod/database`.
 - **The token stays out of your app.** `VAULT_TOKEN` is removed from the environment your application sees.
-- **Token or AppRole.** With AppRole it logs in once per start, reads, and revokes the session before your app runs.
+- **Token, AppRole or a certificate.** With AppRole (a secret ID or a [certificate](#certificate-login)) it logs in once per start, reads, and revokes the session before your app runs.
 - Works with HashiCorp Vault (KV v1 and v2, auto-detected) and with Vault-compatible servers.
 - Same configuration and behaviour as the [Node.js package](https://github.com/kaylovh/vault-env-loader/tree/main/node).
 
@@ -79,12 +79,13 @@ Connection settings use Vault's standard variable names, so the `vault` CLI, `hv
 | `VAULT_ROLE_ID` / `VAULT_ROLE_ID_FILE` | `--role-id-file` | [AppRole](#approle) role ID, used only when no token is set. |
 | `VAULT_SECRET_ID` / `VAULT_SECRET_ID_FILE` | `--secret-id-file` | AppRole secret ID. There is no `--secret-id` flag, for the same reason as `--token`. |
 | `VAULT_ENV_APPROLE_MOUNT` | `--approle-mount` | AppRole auth mount. Default `approle`. |
+| `VAULT_CLIENT_CERTIFICATE_PATH`, `VAULT_CLIENT_KEY_PATH`, `VAULT_CLIENT_CERTIFICATE_PASSWORD(_FILE)`, `VAULT_ENV_JWT_MOUNT` | see [Certificate login](#certificate-login) | Log in with the role ID and a certificate instead of a secret ID. |
 | `VAULT_NAMESPACE` | — | Vault Enterprise namespace. |
 | `VAULT_CACERT` / `VAULT_CAPATH` | — | Extra CA certificate file / directory (every `*.pem` and `*.crt` in it). The system trust store is always used too. |
 | `VAULT_ENV_IMPORT` | `--import` | What to load, comma or newline separated (flag repeatable). Required. |
 | `VAULT_ENV_BASE` | `--base` | Base path for relative imports. |
 | `VAULT_ENV_OVERRIDE` | `--override` | `true`: replace variables that are already set. Default: keep them. |
-| `VAULT_ENV_KEEP_TOKEN` | `--keep-token` | `true`: leave `VAULT_TOKEN` (or the AppRole variables) in the application's environment. |
+| `VAULT_ENV_KEEP_TOKEN` | `--keep-token` | `true`: leave `VAULT_TOKEN` (or the AppRole / certificate variables) in the application's environment. |
 | `VAULT_ENV_TIMEOUT` | `--timeout` | Seconds per request. Default 10. |
 | `VAULT_ENV_RETRIES` | `--retries` | Retries for transient failures. Default 3 (1 s, 2 s, 4 s). |
 | `VAULT_ENV_ALLOW_HTTP` | — | `true` to allow plain `http://` to a host other than localhost. Prints a warning on every start. |
@@ -134,6 +135,81 @@ Things to know:
 - **Relative imports** need a base path. AppRole tokens usually carry only `role_name` as metadata, so set `VAULT_ENV_BASE`, or write absolute `vault://` paths. A server that puts `application` and `environment` in the session's metadata gets the base from there, as with tokens.
 - **The login is not repeated once it was sent.** Connection failures before that, 429 and 503 are retried; a timeout or 5xx after the request went out is not, because Vault may already have used up a secret ID use.
 - Response wrapping (`secret_id` delivered as a wrapping token) is not supported.
+
+## Certificate login
+
+Instead of a secret ID, a role can log in with a **certificate**, like an Azure app registration's certificate credential: the application signs a short-lived JWT (a *client assertion*) with its private key, and Vault checks it against the public key it trusts. The private key never leaves the application, and nothing that crosses the network can be replayed.
+
+```bash
+pip install "vault-env-loader[cert]"      # the certificate method needs cryptography >= 3.4
+```
+
+```bash
+VAULT_ADDR=https://vault.example.com
+VAULT_ROLE_ID=59d6d1ca-47bb-4e7e-a40b-8be3bc5a0ba8
+VAULT_CLIENT_CERTIFICATE_PATH=/run/secrets/vault/app.pem   # one PEM file: private key and certificate
+VAULT_ENV_IMPORT="vault://secret/order-service/prod/database"
+```
+
+| Variable | Flag | Meaning |
+|---|---|---|
+| `VAULT_CLIENT_CERTIFICATE_PATH` | `--client-certificate-path` | PEM file with the certificate (the first `BEGIN CERTIFICATE` block) and, unless the next variable is set, the private key. Any path you like; `~` is not expanded. |
+| `VAULT_CLIENT_KEY_PATH` | `--client-key-path` | The private key, when it is in a file of its own. |
+| `VAULT_CLIENT_CERTIFICATE_PASSWORD` / `VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE` | — | Password of an encrypted key (`ENCRYPTED PRIVATE KEY`). Taken as it is; the file loses one trailing line break. No flag, for the same reason as `--token`. |
+| `VAULT_ENV_JWT_MOUNT` | `--jwt-mount` | JWT auth mount. Default `jwt`. |
+
+Keys: RSA (signed RS256), EC P-256 (ES256) or EC P-384 (ES384), PEM only (PKCS#8, PKCS#1 or SEC 1). PKCS#12 / PFX files are not read: `openssl pkcs12 -in app.pfx -out app.pem` converts one.
+
+Which method is used:
+
+1. `VAULT_TOKEN` or `VAULT_TOKEN_FILE` set → the token, as before; the other variables are left alone (a note says so).
+2. A role ID and `VAULT_CLIENT_CERTIFICATE_PATH` → certificate login. A secret ID as well is a configuration error (exit 78): one or the other.
+3. `VAULT_CLIENT_CERTIFICATE_PATH` without a role ID → configuration error (exit 78).
+4. Otherwise, as in 0.3 (AppRole with a secret ID, or a token). A key path or password without a certificate path changes nothing.
+
+What happens:
+
+1. The certificate and key are read and checked (readable, PEM, the key belongs to the certificate, the password is right). Any problem fails with exit 78 **before any request**.
+2. A JWT is signed: header `alg`, `typ: JWT`, `x5t#S256` (base64url SHA-256 of the certificate); claims `iss` = `sub` = the role ID, `aud` = `VAULT_ADDR` + `/v1/auth/<mount>/login` (scheme and host in lower case, no default port, no trailing `/`), `iat`, `exp` = `iat` + 120 s, and a random 128-bit `jti`.
+3. `POST auth/<mount>/login` with `{"role": <role ID>, "jwt": <JWT>}`, then the imports are read with the session token, then `auth/token/revoke-self`, then your command starts — exactly as with AppRole. The session token never reaches your command or the disk, and only the variables that were used are removed from its environment (unless `VAULT_ENV_KEEP_TOKEN=true`). The files are never touched.
+
+Things to know:
+
+- **Retries are safe.** A certificate can log in any number of times, so connection failures, timeouts, 429 and 5xx are retried (`VAULT_ENV_RETRIES`), each time with a new assertion. A 400 / 403 is not: exit 78, `Certificate login failed: the role ID or certificate is not accepted (mount jwt).` — the server's own text is never printed.
+- **Expiry.** `check` shows the certificate and when it expires: `auth     certificate (role_id 59d6d1ca..., cert q3Z1Ab12..., expires 2028-11-20, 728 days, mount jwt; session revoked after reading)`. With fewer than 30 days left, every run warns. An expired certificate is still sent (a plain Vault JWT role does not look at it) with a warning.
+- **Whoever can read the key file can log in.** Mount it with tight permissions, like any secret.
+- **Python: the `[cert]` extra.** Signing uses the [`cryptography`](https://pypi.org/project/cryptography/) package, imported only when this method is chosen; the base package stays dependency-free. Without it the wrapper exits 78 with the install command. On Python 3.6 and 3.7, pip installs an old `cryptography` that no longer gets security fixes: use Python 3.8 or later for this method if you can.
+
+### With HashiCorp Vault
+
+vault-env-loader sends the role ID as the JWT role's name, so name the role after it. A JWT auth method that trusts your certificate's public key:
+
+```bash
+vault auth enable jwt
+openssl x509 -in app.pem -pubkey -noout > app.pub
+vault write auth/jwt/config jwt_validation_pubkeys=@app.pub jwt_supported_algs=RS256,ES256,ES384
+vault write auth/jwt/role/order-service-prod role_type=jwt user_claim=sub \
+    bound_subject=order-service-prod bound_audiences=https://vault.example.com/v1/auth/jwt/login \
+    token_policies=order-service-prod token_ttl=10m
+# then VAULT_ROLE_ID=order-service-prod
+```
+
+Such a token carries only `role` as metadata, so set `VAULT_ENV_BASE` or write absolute `vault://` paths for the imports.
+
+### Other Vault clients
+
+Libraries that log in with a JWT but cannot sign one can use the same assertion:
+
+```python
+import hvac
+from vault_env_loader import client_assertion
+
+jwt = client_assertion(role_id=ROLE_ID, certificate_path="/run/secrets/vault/app.pem", vault_addr=VAULT_ADDR)
+client = hvac.Client(url=VAULT_ADDR)
+client.auth.jwt.jwt_login(role=ROLE_ID, jwt=jwt)
+```
+
+`client_assertion(role_id=, certificate_path=, key_path=None, password=None, vault_addr=, mount="jwt")` returns the signed JWT (valid 120 s, a new `jti` each call) and raises `VaultEnvError` for a file it cannot use. hvac does not renew or log in again by itself: on a 403, sign a new assertion and log in again; that costs nothing.
 
 ## Imports
 
@@ -193,6 +269,9 @@ Nothing is started unless every non-optional import loads. The process exits wit
 | AppRole login 400 / 403 — wrong, expired or used-up role ID / secret ID | no |
 | AppRole login: connection not established, 429, 503 | yes |
 | AppRole login: timeout, connection lost or 5xx after the request was sent | no |
+| Certificate login 400 / 401 / 403 — role ID or certificate not accepted | no |
+| Certificate login: connection errors, timeouts, 429, 5xx (a new assertion each time) | yes |
+| Certificate or key file unreadable, not PEM, wrong password, key not matching | no — fails before any request |
 | 404 — path does not exist (skipped if `optional:`) | no |
 | 429, 500, 502, 503, 504, connection errors, timeouts | yes, `VAULT_ENV_RETRIES` times — except a 502 that names keys with a permanent reason (e.g. `alias 'x' could not be resolved: not_found`), which fails at once |
 | 3xx redirects | not followed (the token would go with them); fails |
@@ -207,24 +286,26 @@ A token that expires within 14 days produces a warning (not an AppRole session: 
 - **One value is limited to 128 KB** (the Linux limit for one environment string); larger values are refused with the key name.
 - **No `.pth` auto-loading.** Loading on every interpreter start (including `pip`) would be invisible and fragile; the wrapper already needs no code change.
 - **Windows** has no `exec`: the wrapper runs the command as a child and passes its exit code through.
-- Token and AppRole authentication; Kubernetes auth may follow.
+- Token, AppRole (secret ID or certificate) authentication; Kubernetes auth may follow.
 
 ## Library API
 
 ```python
-from vault_env_loader import load, fetch, VaultEnvError
+from vault_env_loader import load, fetch, client_assertion, VaultEnvError
 
 load(env=None, **options)    # -> names set in os.environ (or in the mapping `env`)
 fetch(env=None, **options)   # -> {NAME: value}; does not touch the environment
+client_assertion(role_id=..., certificate_path=..., vault_addr=...)   # -> a signed JWT for auth/jwt/login ([cert] extra)
 ```
 
-`options` mirror the variables above: `addr`, `token`, `token_file`, `role_id`, `role_id_file`, `secret_id`, `secret_id_file`, `approle_mount`, `imports`, `base`, `namespace`, `cacert`, `capath`, `override`, `keep_token`, `timeout`, `retries`, `allow_http`. `env` is the mapping configuration is read from (and, for `load()`, written to); default `os.environ`. `VaultEnvError` has a `code`: `config`, `auth`, `not_found`, `resolve`, `collision`, `value`, `unavailable`. Messages contain paths and key names, never values or tokens.
+`options` mirror the variables above: `addr`, `token`, `token_file`, `role_id`, `role_id_file`, `secret_id`, `secret_id_file`, `approle_mount`, `client_certificate_path`, `client_key_path`, `client_certificate_password`, `client_certificate_password_file`, `jwt_mount`, `imports`, `base`, `namespace`, `cacert`, `capath`, `override`, `keep_token`, `timeout`, `retries`, `allow_http`. `env` is the mapping configuration is read from (and, for `load()`, written to); default `os.environ`. `VaultEnvError` has a `code`: `config`, `auth`, `not_found`, `resolve`, `collision`, `value`, `unavailable`. Messages contain paths and key names, never values or tokens.
 
 ## Security notes
 
 - Secret values are never written to logs, error messages, argv or disk. Unexpected errors print only the exception type, never a traceback.
 - Redirects are not followed, so the token (and the AppRole login) is only ever sent to `VAULT_ADDR`.
 - The AppRole login body is never logged; `check` shows only the first 8 characters of the role ID.
+- Certificate login: the private key is only read, never sent, logged or copied; the signed assertion (valid 120 s, single-use `jti`) is the only thing that leaves the process, and it is never logged. Error messages name the files, never their contents.
 - Requests carry `User-Agent: vault-env-loader/<version> python/<version>`, so server audit logs can tell which client read what.
 
 ## License

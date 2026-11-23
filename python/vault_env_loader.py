@@ -5,13 +5,19 @@ before your application starts.
 One file, zero dependencies, Python >= 3.6. It is at the same time:
   - the CLI:     vault-env-loader [options] -- <command...>
                  python -m vault_env_loader [options] -- <command...>
-  - the library: load() / fetch()
+  - the library: load() / fetch() / client_assertion()
+
+Certificate login (and client_assertion) needs the optional cryptography package:
+pip install "vault-env-loader[cert]". It is imported only when that method is used.
 
 Behaviour follows the Node.js package of the same name; both run the shared
 cases in spec/cases.json. Secret values never go to logs, error messages, argv
 or disk.
 """
 
+import base64
+import calendar
+import hashlib
 import http.client
 import json
 import os
@@ -24,9 +30,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 
-__version__ = '0.3.0'
-__all__ = ['load', 'fetch', 'VaultEnvError', '__version__']
+__version__ = '0.4.0'
+__all__ = ['load', 'fetch', 'client_assertion', 'VaultEnvError', '__version__']
 
 TAG = '[vault-env-loader]'
 EX_CONFIG = 78
@@ -44,6 +51,8 @@ ALIAS_FAILURE = re.compile(r"^alias '(.+)' could not be resolved: ([a-z_]+)$")
 TRUTHY = ('1', 'true', 'yes', 'on')
 FALSY = ('0', 'false', 'no', 'off')
 APPROLE_MOUNT = re.compile(r'^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$')
+ASSERTION_LIFETIME = 120
+CERT_WARN_DAYS = 30
 
 
 class VaultEnvError(Exception):
@@ -102,14 +111,28 @@ def read_config(options=None, env=None):
     secret_id_file = non_empty(pick('secret_id_file', 'VAULT_SECRET_ID_FILE'))
     secret_id = non_empty(options['secret_id']) if options.get('secret_id') is not None else non_empty(env.get('VAULT_SECRET_ID'))
     approle_given = bool(role_id or role_id_file or secret_id or secret_id_file)
+    # Certificate login: only VAULT_CLIENT_CERTIFICATE_PATH selects it. A key path or
+    # password without it changes nothing, as in 0.3. The password is taken as it is.
+    cert_path = non_empty(pick('client_certificate_path', 'VAULT_CLIENT_CERTIFICATE_PATH'))
+    key_path = non_empty(pick('client_key_path', 'VAULT_CLIENT_KEY_PATH')) if cert_path else None
+    password_given = options.get('client_certificate_password') is not None
+    password = str(options['client_certificate_password']) if password_given else env.get('VAULT_CLIENT_CERTIFICATE_PASSWORD')
+    if password == '':
+        password = None
+    password_file = non_empty(pick('client_certificate_password_file', 'VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE'))
 
     # A token, when there is one, is used exactly as before AppRole support; AppRole
     # variables beside it are left alone (they may be meant for another tool).
     # Decided from what is set, before any file is read, so that a disabled run
     # removes the same variables a load would.
-    auth = 'token' if token or token_file else 'approle'
+    if token or token_file:
+        auth = 'token'
+    elif cert_path and (role_id or role_id_file) and not (secret_id or secret_id_file):
+        auth = 'certificate'
+    else:
+        auth = 'approle'
     used = []
-    if auth == 'approle':
+    if auth != 'token':
         if role_id:
             if options.get('role_id') is None:
                 used.append('VAULT_ROLE_ID')
@@ -120,6 +143,16 @@ def read_config(options=None, env=None):
                 used.append('VAULT_SECRET_ID')
         elif secret_id_file and options.get('secret_id_file') is None:
             used.append('VAULT_SECRET_ID_FILE')
+        if cert_path:
+            if options.get('client_certificate_path') is None:
+                used.append('VAULT_CLIENT_CERTIFICATE_PATH')
+            if key_path and options.get('client_key_path') is None:
+                used.append('VAULT_CLIENT_KEY_PATH')
+            if password is not None:
+                if not password_given:
+                    used.append('VAULT_CLIENT_CERTIFICATE_PASSWORD')
+            elif password_file and options.get('client_certificate_password_file') is None:
+                used.append('VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE')
     token_from_file = auth == 'token' and non_empty(env.get('VAULT_TOKEN')) is None and options.get('token') is None and bool(token_file)
 
     def flag(opt, var):
@@ -149,20 +182,33 @@ def read_config(options=None, env=None):
             raise VaultEnvError('VAULT_TOKEN_FILE (%s) is empty.' % token_file, 'config')
     notes = []
     if auth == 'token':
-        if approle_given:
+        if cert_path:
+            notes.append('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID / VAULT_CLIENT_CERTIFICATE_PATH are ignored.')
+        elif approle_given:
             notes.append('VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID are ignored.')
     elif role_id or role_id_file:
+        if cert_path and auth != 'certificate':
+            raise VaultEnvError('Both a secret ID and a client certificate are set (VAULT_SECRET_ID / VAULT_CLIENT_CERTIFICATE_PATH): '
+                                'AppRole login takes one or the other.', 'config')
         if not role_id:
             role_id = _read_secret_file(role_id_file, 'VAULT_ROLE_ID_FILE')
-        if not secret_id and secret_id_file:
+        if auth == 'certificate':
+            if password is None and password_file:
+                password = _read_password_file(password_file)
+        elif not secret_id and secret_id_file:
             secret_id = _read_secret_file(secret_id_file, 'VAULT_SECRET_ID_FILE')
+    elif cert_path:
+        raise VaultEnvError('VAULT_CLIENT_CERTIFICATE_PATH is set but VAULT_ROLE_ID is not: certificate login needs both.', 'config')
     elif approle_given:
         raise VaultEnvError('VAULT_SECRET_ID is set but VAULT_ROLE_ID is not: AppRole login needs both.', 'config')
     else:
         raise VaultEnvError('No token: set VAULT_TOKEN or VAULT_TOKEN_FILE.', 'config')
     approle_mount = non_empty(pick('approle_mount', 'VAULT_ENV_APPROLE_MOUNT')) or 'approle'
-    if not APPROLE_MOUNT.match(approle_mount) or any(seg in ('.', '..') for seg in approle_mount.split('/')):
+    if not _valid_mount(approle_mount):
         raise VaultEnvError('VAULT_ENV_APPROLE_MOUNT must be a mount path such as approle.', 'config')
+    jwt_mount = (non_empty(pick('jwt_mount', 'VAULT_ENV_JWT_MOUNT')) or 'jwt') if auth == 'certificate' else None
+    if jwt_mount is not None and not _valid_mount(jwt_mount):
+        raise VaultEnvError('VAULT_ENV_JWT_MOUNT must be a mount path such as jwt.', 'config')
 
     url = urllib.parse.urlsplit(addr)
     if url.scheme not in ('http', 'https') or not url.hostname:
@@ -191,9 +237,13 @@ def read_config(options=None, env=None):
         'insecure_http': url.scheme == 'http' and not is_loopback(url.hostname),
         'auth': auth,
         'token': token if auth == 'token' else None,
-        'role_id': role_id if auth == 'approle' else None,
+        'role_id': role_id if auth != 'token' else None,
         'secret_id': secret_id if auth == 'approle' else None,
         'approle_mount': approle_mount,
+        'certificate_path': cert_path if auth == 'certificate' else None,
+        'key_path': key_path if auth == 'certificate' else None,
+        'certificate_password': password if auth == 'certificate' else None,
+        'jwt_mount': jwt_mount,
         'approle_vars_used': used,
         'notes': notes,
         'token_from_file': token_from_file,
@@ -232,6 +282,24 @@ def _read_secret_file(path, name):
     if not v:
         raise VaultEnvError('%s (%s) is empty.' % (name, path), 'config')
     return v
+
+
+def _read_password_file(path):
+    """A password file loses one trailing line break, nothing else: a password may
+    begin or end with spaces."""
+    try:
+        with open(path, 'r', encoding='utf-8', newline='') as f:
+            v = f.read()
+    except OSError as e:
+        raise VaultEnvError('Cannot read VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE (%s): %s.' % (path, _errno_name(e)), 'config')
+    v = re.sub(r'\r?\n\Z', '', v)
+    if not v:
+        raise VaultEnvError('VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE (%s) is empty.' % path, 'config')
+    return v
+
+
+def _valid_mount(m):
+    return bool(APPROLE_MOUNT.match(m)) and not any(seg in ('.', '..') for seg in m.split('/'))
 
 
 def is_loopback(host):
@@ -502,14 +570,207 @@ def approle_login(cfg):
 
 def revoke_session(cfg):
     """Best effort: the session expires by itself if this fails."""
+    what = 'certificate login session' if cfg.get('auth') == 'certificate' else 'AppRole session'
     try:
         status, _ = http_request(cfg, 'POST', 'auth/token/revoke-self')
         if status not in (200, 204):
-            warn('Could not revoke the AppRole session (HTTP %s); it expires by itself.' % status)
+            warn('Could not revoke the %s (HTTP %s); it expires by itself.' % (what, status))
     except _NetworkError as e:
-        warn('Could not revoke the AppRole session (%s); it expires by itself.' % e.what)
+        warn('Could not revoke the %s (%s); it expires by itself.' % (what, e.what))
     finally:
         cfg['token'] = None
+
+
+# ---------------------------------------------------------------------------
+# Certificate login: sign a short-lived JWT (a client assertion) with the private
+# key, log in with auth/<mount>/login {role, jwt}, read, revoke the session.
+
+PEM_CERT = re.compile(r'-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----')
+PEM_KEY = re.compile(r'-----BEGIN ((?:RSA |EC |ENCRYPTED )?PRIVATE KEY)-----[\s\S]+?-----END \1-----')
+CERT_NEEDS_CRYPTOGRAPHY = ('Certificate login needs the cryptography package, which is not installed: '
+                           'pip install "vault-env-loader[cert]".')
+
+
+def _crypto():
+    """The cryptography modules, imported only when a certificate is used."""
+    try:
+        # cryptography announces its own deprecations (old Pythons) at import; that is
+        # not this run's business, and under -W error it would hide the real result.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
+    except ImportError:
+        raise VaultEnvError(CERT_NEEDS_CRYPTOGRAPHY, 'config')
+    return {'x509': x509, 'hashes': hashes, 'serialization': serialization, 'ec': ec, 'padding': padding, 'rsa': rsa, 'utils': utils}
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+
+def load_client_certificate(cert_path, key_path=None, password=None):
+    """Read the certificate and its private key. Every problem is a config error, raised
+    before any request; messages name files, never their contents."""
+    def read(path, what):
+        try:
+            with open(path, 'r', encoding='latin-1') as f:
+                return f.read()
+        except OSError as e:
+            raise VaultEnvError('Cannot read the client %s file (%s): %s.' % (what, path, _errno_name(e)), 'config')
+
+    cert_text = read(cert_path, 'certificate')
+    cm = PEM_CERT.search(cert_text)
+    if not cm:
+        raise VaultEnvError('The client certificate file (%s) holds no PEM certificate (-----BEGIN CERTIFICATE-----). '
+                            'PKCS#12 / PFX is not supported: convert it to PEM.' % cert_path, 'config')
+    c = _crypto()
+    ser = c['serialization']
+    der = base64.b64decode(re.sub(r'\s+', '', cm.group(1)))
+    try:
+        cert = c['x509'].load_der_x509_certificate(der)
+        cert_spki = cert.public_key().public_bytes(ser.Encoding.DER, ser.PublicFormat.SubjectPublicKeyInfo)
+        not_after = cert.not_valid_after_utc if hasattr(cert, 'not_valid_after_utc') else cert.not_valid_after
+    except Exception:
+        raise VaultEnvError('The client certificate file (%s) does not hold a valid X.509 certificate.' % cert_path, 'config')
+    key_file = key_path or cert_path
+    key_text = read(key_path, 'key') if key_path else cert_text
+    km = PEM_KEY.search(key_text)
+    if not km:
+        if key_path:
+            raise VaultEnvError('No private key in the client key file (%s).' % key_path, 'config')
+        raise VaultEnvError('No private key in the client certificate file (%s): put the key in the same PEM file, '
+                            'or set VAULT_CLIENT_KEY_PATH.' % cert_path, 'config')
+    encrypted = km.group(1) == 'ENCRYPTED PRIVATE KEY' or re.search(r'Proc-Type:\s*4,ENCRYPTED', km.group(0)) is not None
+    if encrypted and password is None:
+        raise VaultEnvError('The private key in %s is encrypted: set VAULT_CLIENT_CERTIFICATE_PASSWORD or '
+                            'VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE.' % key_file, 'config')
+    try:
+        key = ser.load_pem_private_key(km.group(0).encode('latin-1'), password=password.encode('utf-8') if encrypted else None)
+    except Exception:
+        if encrypted:
+            raise VaultEnvError('Cannot decrypt the private key in %s: wrong password.' % key_file, 'config')
+        raise VaultEnvError('The private key in %s is not a valid PEM key.' % key_file, 'config')
+    hashes, ec = c['hashes'], c['ec']
+    if isinstance(key, c['rsa'].RSAPrivateKey):
+        alg, curve = 'RS256', None
+    elif isinstance(key, ec.EllipticCurvePrivateKey) and key.curve.name in ('secp256r1', 'secp384r1'):
+        alg, curve = ('ES256', (hashes.SHA256, 32)) if key.curve.name == 'secp256r1' else ('ES384', (hashes.SHA384, 48))
+    else:
+        raise VaultEnvError('Unsupported key in %s: use RSA or EC P-256 / P-384.' % key_file, 'config')
+    if key.public_key().public_bytes(ser.Encoding.DER, ser.PublicFormat.SubjectPublicKeyInfo) != cert_spki:
+        raise VaultEnvError('The private key in %s does not belong to the certificate in %s.' % (key_file, cert_path), 'config')
+    return {'key': key, 'alg': alg, 'curve': curve, 'x5t': _b64url(hashlib.sha256(der).digest()),
+            'not_after': calendar.timegm(not_after.utctimetuple()), '_crypto': c}
+
+
+def audience(addr, mount):
+    """VAULT_ADDR normalised + /v1/auth/<mount>/login: the aud claim."""
+    u = urllib.parse.urlsplit(str(addr).strip())
+    scheme = u.scheme.lower()
+    try:
+        port = u.port
+    except ValueError:
+        port = -1
+    if scheme not in ('http', 'https') or not u.hostname or port == -1:
+        raise VaultEnvError('VAULT_ADDR is not a valid URL.', 'config')
+    host = '[%s]' % u.hostname if ':' in u.hostname else u.hostname
+    if port is not None and port != {'https': 443, 'http': 80}[scheme]:
+        host += ':%d' % port
+    return '%s://%s%s/v1/auth/%s/login' % (scheme, host, re.sub(r'/+$', '', u.path), mount)
+
+
+def sign_assertion(cred, role_id, aud, now=None):
+    """Header, claims and signature. A new iat and jti on every call."""
+    iat = int(time.time() if now is None else now)
+    header = {'alg': cred['alg'], 'typ': 'JWT', 'x5t#S256': cred['x5t']}
+    claims = {'iss': role_id, 'sub': role_id, 'aud': aud, 'iat': iat, 'exp': iat + ASSERTION_LIFETIME,
+              'jti': base64.b16encode(os.urandom(16)).decode('ascii').lower()}
+
+    def part(obj):
+        return _b64url(json.dumps(obj, separators=(',', ':'), ensure_ascii=False).encode('utf-8'))
+
+    signing_input = '%s.%s' % (part(header), part(claims))
+    data = signing_input.encode('ascii')
+    c = cred['_crypto']
+    if cred['curve']:
+        hash_cls, size = cred['curve']
+        r, s = c['utils'].decode_dss_signature(cred['key'].sign(data, c['ec'].ECDSA(hash_cls())))
+        sig = r.to_bytes(size, 'big') + s.to_bytes(size, 'big')
+    else:
+        sig = cred['key'].sign(data, c['padding'].PKCS1v15(), c['hashes'].SHA256())
+    return '%s.%s' % (signing_input, _b64url(sig))
+
+
+def _iso_date(sec):
+    return time.strftime('%Y-%m-%d', time.gmtime(sec))
+
+
+def certificate_status(not_after, now):
+    """Days left (rounded down), the warning (below 30 days, or expired) and check's text."""
+    days = int((not_after - now) // 86400)
+    date = _iso_date(not_after)
+    expired = not_after <= now
+    warning = None
+    if expired:
+        warning = 'The client certificate expired on %s.' % date
+    elif days < CERT_WARN_DAYS:
+        warning = 'The client certificate expires in %d day(s), on %s. Replace it before then.' % (days, date)
+    return {'days': days, 'warning': warning, 'text': 'expired %s' % date if expired else 'expires %s, %d days' % (date, days)}
+
+
+def certificate_check_line(role_id, x5t, status, mount):
+    return 'auth     certificate (role_id %s..., cert %s..., %s, mount %s; session revoked after reading)' % (
+        str(role_id)[:8], x5t[:8], status['text'], mount)
+
+
+def client_assertion(role_id=None, certificate_path=None, key_path=None, password=None, vault_addr=None, mount='jwt'):
+    """A client assertion for auth/<mount>/login, for Vault clients that cannot sign one
+    themselves (hvac: client.auth.jwt.jwt_login(role=role_id, jwt=...)).
+    Needs the cryptography package: pip install "vault-env-loader[cert]"."""
+    for name, v in (('role_id', role_id), ('certificate_path', certificate_path), ('vault_addr', vault_addr)):
+        if not non_empty(v):
+            raise VaultEnvError('client_assertion() needs %s.' % name, 'config')
+    mount = non_empty(mount) or 'jwt'
+    if not _valid_mount(mount):
+        raise VaultEnvError('The JWT mount must be a mount path such as jwt.', 'config')
+    password = None if password is None or password == '' else str(password)
+    cred = load_client_certificate(certificate_path.strip(), non_empty(key_path), password)
+    return sign_assertion(cred, role_id.strip(), audience(vault_addr, mount))
+
+
+def certificate_login(cfg):
+    """Unlike a secret ID, a certificate can log in any number of times, so every failure
+    that may pass is retried (connection, timeout, 429, 5xx), each time with a new
+    assertion. A session the server may have issued expires by itself."""
+    api_path = 'auth/%s/login' % cfg['jwt_mount']
+    aud = audience(cfg['addr'], cfg['jwt_mount'])
+    attempt = 0
+    while True:
+        res, net_err = None, None
+        try:
+            body = {'role': cfg['role_id'], 'jwt': sign_assertion(cfg['credential'], cfg['role_id'], aud)}
+            res = http_request(cfg, 'POST', api_path, body, with_token=False)
+        except _NetworkError as e:
+            net_err = e
+        again = res[0] == 429 or res[0] >= 500 if res is not None else True
+        if not again or attempt >= cfg['retries']:
+            if net_err is not None:
+                raise VaultEnvError('Certificate login to Vault %s.%s' % (net_err.what, '' if net_err.what == 'timed out' else _proxy_hint(cfg)), 'unavailable')
+            break
+        time.sleep(cfg['retry_delay'] * (2 ** attempt))
+        attempt += 1
+    status, resp = res
+    if status in (400, 401, 403):
+        raise VaultEnvError('Certificate login failed: the role ID or certificate is not accepted (mount %s).' % cfg['jwt_mount'], 'auth')
+    if status != 200:
+        raise VaultEnvError('Vault answered HTTP %s to the certificate login.' % status, 'unavailable')
+    auth = resp.get('auth') if isinstance(resp, dict) else None
+    token = auth.get('client_token') if isinstance(auth, dict) else None
+    if not isinstance(token, str) or not token:
+        raise VaultEnvError('Vault answered the certificate login without a token (unexpected response).', 'unavailable')
+    cfg['token'] = token
 
 
 # ---------------------------------------------------------------------------
@@ -709,9 +970,15 @@ def plan(values, env, override):
 # Pipeline
 
 def collect(cfg):
-    if cfg.get('auth') != 'approle':
+    if cfg.get('auth') not in ('approle', 'certificate'):
         return _collect(cfg)
-    approle_login(cfg)
+    if cfg['auth'] == 'certificate':
+        # Read and check the files first: a bad certificate fails before any request.
+        cfg['credential'] = load_client_certificate(cfg['certificate_path'], cfg['key_path'], cfg['certificate_password'])
+        cfg['certificate'] = certificate_status(cfg['credential']['not_after'], time.time())
+        certificate_login(cfg)
+    else:
+        approle_login(cfg)
     try:
         return _collect(cfg)
     finally:
@@ -722,9 +989,11 @@ def _collect(cfg):
     warnings = list(cfg.get('notes') or [])
     if cfg['insecure_http']:
         warnings.append('VAULT_ADDR uses plain http: the token and every secret cross the network unencrypted.')
+    if cfg.get('certificate') and cfg['certificate']['warning']:
+        warnings.append(cfg['certificate']['warning'])
     me = lookup_self(cfg)
     # An AppRole session is short-lived by design: its TTL is no reason to warn.
-    if cfg.get('auth') != 'approle' and me and not me['denied'] and 0 < me['ttl'] < TTL_WARN_SECONDS:
+    if cfg.get('auth') not in ('approle', 'certificate') and me and not me['denied'] and 0 < me['ttl'] < TTL_WARN_SECONDS:
         warnings.append('The token expires in %d day(s). Issue a new one before then.' % max(1, round(me['ttl'] / 86400.0)))
     base_info = resolve_base(cfg, me)
     results = []
@@ -789,8 +1058,9 @@ def fetch(env=None, **options):
     """Read the configured imports and return {NAME: value} without touching the environment.
 
     Keyword options mirror the environment variables: addr, token, token_file, role_id,
-    role_id_file, secret_id, secret_id_file, approle_mount, imports, base, namespace, cacert,
-    capath, timeout, retries, allow_http.
+    role_id_file, secret_id, secret_id_file, approle_mount, client_certificate_path,
+    client_key_path, client_certificate_password, client_certificate_password_file, jwt_mount,
+    imports, base, namespace, cacert, capath, timeout, retries, allow_http.
     """
     cfg = read_config(options, os.environ if env is None else env)
     if cfg.get('disabled'):
@@ -839,16 +1109,25 @@ Options (each also has an environment variable):
   --role-id-file <path> VAULT_ROLE_ID_FILE      AppRole, when no token is set (or VAULT_ROLE_ID)
   --secret-id-file <path> VAULT_SECRET_ID_FILE  (the secret ID itself only via VAULT_SECRET_ID)
   --approle-mount <path> VAULT_ENV_APPROLE_MOUNT default approle
+  --client-certificate-path <path>
+                        VAULT_CLIENT_CERTIFICATE_PATH  certificate login with the role ID (one PEM file: key and certificate)
+  --client-key-path <path>
+                        VAULT_CLIENT_KEY_PATH   the key, when it is in a file of its own
+  --jwt-mount <path>    VAULT_ENV_JWT_MOUNT     default jwt
   --import <spec>       VAULT_ENV_IMPORT        repeatable; comma-separated in the variable
   --base <path>         VAULT_ENV_BASE          base for relative imports
   --override            VAULT_ENV_OVERRIDE      replace variables that are already set
-  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN (or the AppRole variables) on to the command
+  --keep-token          VAULT_ENV_KEEP_TOKEN    pass VAULT_TOKEN (or the AppRole / certificate variables) on to the command
   --timeout <seconds>   VAULT_ENV_TIMEOUT       per request, default 10
   --retries <n>         VAULT_ENV_RETRIES       default 3
 
 Environment only:
   VAULT_ENV_ENABLED     false: load nothing, remove the credentials, run the command
                         true: fail unless VAULT_ADDR and VAULT_ENV_IMPORT are set
+  VAULT_CLIENT_CERTIFICATE_PASSWORD / VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE
+                        the password of an encrypted private key
+
+Certificate login needs: pip install "vault-env-loader[cert]"
 
 Import spec:  [optional:]vault://<mount>/<path> | <relative path> | vault://   [?prefix=X_&name=auto|verbatim|upper&kv=1|2]
 Docs: https://github.com/kaylovh/vault-env-loader
@@ -872,7 +1151,8 @@ def parse_args(argv):
         if a == '--':
             command = argv[i + 1:]
             break
-        elif a in ('--addr', '--token-file', '--role-id-file', '--secret-id-file', '--approle-mount', '--import', '--base', '--timeout', '--retries'):
+        elif a in ('--addr', '--token-file', '--role-id-file', '--secret-id-file', '--approle-mount', '--client-certificate-path',
+                   '--client-key-path', '--jwt-mount', '--import', '--base', '--timeout', '--retries'):
             v = val()
             i += 1
             if a == '--import':
@@ -889,6 +1169,9 @@ def parse_args(argv):
         elif a == '--secret-id':
             raise VaultEnvError('There is no --secret-id option: command-line arguments are visible to every user (ps). '
                                 'Use VAULT_SECRET_ID or --secret-id-file.', 'config')
+        elif a == '--client-certificate-password':
+            raise VaultEnvError('There is no --client-certificate-password option: command-line arguments are visible to every '
+                                'user (ps). Use VAULT_CLIENT_CERTIFICATE_PASSWORD or VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE.', 'config')
         elif a == 'check' and sub is None:
             sub = 'check'
         elif a in ('--version', '-v'):
@@ -918,6 +1201,8 @@ def check(opts):
     lines = ['vault-env-loader %s' % __version__, 'addr     %s' % cfg['addr']]
     if cfg.get('auth') == 'approle':
         lines.append('auth     approle (role_id %s..., mount %s; session revoked after reading)' % (cfg['role_id'][:8], cfg['approle_mount']))
+    if cfg.get('auth') == 'certificate':
+        lines.append(certificate_check_line(cfg['role_id'], cfg['credential']['x5t'], cfg['certificate'], cfg['jwt_mount']))
     if me and not me['denied']:
         meta = ' '.join('%s=%s' % (k, v) for k, v in me['meta'].items())
         expiry = 'expires in %dh' % round(me['ttl'] / 3600.0) if me['ttl'] else 'no expiry'

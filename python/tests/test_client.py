@@ -524,6 +524,240 @@ class AppRole(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Certificate login (0.4)
+
+FIXTURES = os.path.join(HERE, '..', '..', 'spec', 'fixtures')
+RSA_PEM = os.path.join(FIXTURES, 'rsa.pem')
+P256_PEM = os.path.join(FIXTURES, 'p256.pem')
+RSA_X5T = 'TRPxIPG0IpPpJQ7BRpygD3zOwAQ5JyYr2uVlTklRjyk'
+CERT_LOGIN_FAILED = 'Certificate login failed: the role ID or certificate is not accepted (mount jwt).'
+import importlib.util  # noqa: E402
+
+HAVE_CRYPTOGRAPHY = importlib.util.find_spec('cryptography') is not None
+
+
+def cert_of(path):
+    with open(path, encoding='utf-8') as f:
+        text = f.read()
+    start = text.index('-----BEGIN CERTIFICATE-----')
+    return text[start:text.index('-----END CERTIFICATE-----') + 25]
+
+
+def jwt_role(path=RSA_PEM, **extra):
+    return dict({'role': 'role-123', 'certificate': cert_of(path)}, **extra)
+
+
+def cert_env(addr, **extra):
+    env = {'VAULT_ADDR': addr, 'VAULT_ROLE_ID': 'role-123', 'VAULT_CLIENT_CERTIFICATE_PATH': RSA_PEM, 'VAULT_ENV_IMPORT': 'database'}
+    env.update(extra)
+    return env
+
+
+def cert_child_env(addr, **extra):
+    env = child_env(addr, **dict({'VAULT_ROLE_ID': 'role-123', 'VAULT_CLIENT_CERTIFICATE_PATH': RSA_PEM}, **extra))
+    env.pop('VAULT_TOKEN', None)
+    return env
+
+
+def logins(v):
+    return [r for r in v.requests if r['path'] == 'auth/jwt/login']
+
+
+@unittest.skipUnless(HAVE_CRYPTOGRAPHY, 'cryptography is not installed')
+class Certificate(unittest.TestCase):
+    def test_login_read_revoke(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role()) as v:
+            env = cert_env(v.addr)
+            started = int(time.time())
+            with captured_stderr() as err:
+                self.assertEqual(V.load(env=env, **FAST), ['DB_PASSWORD'])
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+            for k in ('VAULT_ROLE_ID', 'VAULT_CLIENT_CERTIFICATE_PATH', 'VAULT_TOKEN'):
+                self.assertNotIn(k, env)
+            self.assertTrue(os.path.exists(RSA_PEM), 'the file itself is never touched')
+            self.assertEqual(err.getvalue(), '', 'no warning for a certificate that is valid for years')
+            self.assertEqual(['%s %s' % (r['method'], r['path']) for r in v.requests], [
+                'POST auth/jwt/login',
+                'GET auth/token/lookup-self',
+                'GET sys/internal/ui/mounts/secret/order-service/prod/database',
+                'GET secret/data/order-service/prod/database',
+                'POST auth/token/revoke-self',
+            ])
+            login = v.requests[0]
+            self.assertIsNone(login['token'])
+            self.assertEqual(sorted(login['body']), ['assertion', 'jwt', 'role'])
+            self.assertEqual(login['body']['assertion']['header'], {'alg': 'RS256', 'typ': 'JWT', 'x5t#S256': RSA_X5T})
+            claims = login['body']['assertion']['claims']
+            self.assertEqual(claims['aud'], '%s/v1/auth/jwt/login' % v.addr)
+            self.assertTrue(claims['iat'] >= started and claims['exp'] == claims['iat'] + 120)
+            self.assertTrue(all(r['token'] == TOKEN for r in v.requests[1:]))
+
+    def test_ec_separate_key_and_another_mount(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role(P256_PEM, mount='ci/jwt')) as v:
+            env = cert_env(v.addr, VAULT_CLIENT_CERTIFICATE_PATH=P256_PEM, VAULT_CLIENT_KEY_PATH=P256_PEM, VAULT_ENV_JWT_MOUNT='ci/jwt')
+            V.load(env=env, **FAST)
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+            self.assertNotIn('VAULT_CLIENT_KEY_PATH', env)
+            self.assertEqual(v.requests[0]['path'], 'auth/ci/jwt/login')
+            self.assertEqual(v.requests[0]['body']['assertion']['header']['alg'], 'ES256')
+
+    def test_refused_login_fails_once_with_78(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role(role='another-role')) as v:
+            code, _, err = run([sys.executable, MODULE, '--', sys.executable, '-c', 'pass'], cert_child_env(v.addr, VAULT_ENV_RETRIES='3'))
+            self.assertEqual(code, 78)
+            self.assertEqual(err, '[vault-env-loader] %s\n' % CERT_LOGIN_FAILED)
+            self.assertEqual(v.paths(), ['auth/jwt/login'])
+
+    def test_bad_certificate_fails_before_any_request(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role()) as v:
+            missing = os.path.join(tempfile.gettempdir(), 'vel-no-such.pem')
+            code, _, err = run([sys.executable, MODULE, '--', sys.executable, '-c', 'pass'], cert_child_env(v.addr, VAULT_CLIENT_CERTIFICATE_PATH=missing))
+            self.assertEqual(code, 78)
+            self.assertEqual(err, '[vault-env-loader] Cannot read the client certificate file (%s): ENOENT.\n' % missing)
+            code, _, err = run([sys.executable, MODULE, '--', sys.executable, '-c', 'pass'],
+                               cert_child_env(v.addr, VAULT_CLIENT_CERTIFICATE_PATH=os.path.join(FIXTURES, 'encrypted.pem'), VAULT_CLIENT_CERTIFICATE_PASSWORD='wrong'))
+            self.assertEqual(code, 78)
+            self.assertIn('wrong password', err)
+            self.assertNotIn('BEGIN', err, 'no file contents in messages')
+            self.assertEqual(v.requests, [])
+
+    def test_retries_with_a_new_assertion(self):
+        routes = dict(APPROLE_ROUTES, **{'auth/jwt/login': [{'status': 503, 'body': {'errors': []}}, {'hang': True}, {'status': 500, 'body': {'errors': []}}, {'verify': True}]})
+        with FakeVault(routes, token=TOKEN, jwt=jwt_role()) as v:
+            env = cert_env(v.addr, VAULT_ENV_TIMEOUT='0.3')
+            V.load(env=env, **FAST)
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+            jtis = [r['body']['assertion']['claims']['jti'] for r in logins(v)]
+            self.assertEqual(len(jtis), 4)
+            self.assertEqual(len(set(jtis)), 4, 'a new jti for every attempt')
+        with FakeVault(dict(APPROLE_ROUTES, **{'auth/jwt/login': {'status': 502, 'body': {'errors': []}}}), token=TOKEN, jwt=jwt_role()) as v:
+            with self.assertRaises(V.VaultEnvError) as cm:
+                V.load(env=cert_env(v.addr, VAULT_ENV_RETRIES='2'), **FAST)
+            self.assertEqual(cm.exception.code, 'unavailable')
+            self.assertEqual(len(logins(v)), 3, 'bounded by VAULT_ENV_RETRIES')
+
+    def test_wrapper_removes_only_what_it_used(self):
+        d = tempfile.mkdtemp()
+        try:
+            pw = os.path.join(d, 'password')
+            with open(pw, 'w') as fh:
+                fh.write('fixture-password\n')
+            role_file = os.path.join(d, 'unused-role-id')
+            with open(role_file, 'w') as fh:
+                fh.write('other')
+            names = ('DB_PASSWORD', 'VAULT_ROLE_ID', 'VAULT_ROLE_ID_FILE', 'VAULT_CLIENT_CERTIFICATE_PATH',
+                     'VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE', 'VAULT_ENV_JWT_MOUNT', 'VAULT_TOKEN')
+            enc = os.path.join(FIXTURES, 'encrypted.pem')
+            with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role(enc)) as v:
+                code, out, err = run([sys.executable, MODULE, '--', sys.executable, '-c',
+                                      'import json, os; print(json.dumps({k: os.environ.get(k) for k in %r}))' % (names,)],
+                                     cert_child_env(v.addr, VAULT_CLIENT_CERTIFICATE_PATH=enc, VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE=pw,
+                                                    VAULT_ROLE_ID_FILE=role_file, VAULT_ENV_JWT_MOUNT='jwt'))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out), {'DB_PASSWORD': 's3cr3t', 'VAULT_ROLE_ID': None, 'VAULT_ROLE_ID_FILE': role_file,
+                                                   'VAULT_CLIENT_CERTIFICATE_PATH': None, 'VAULT_CLIENT_CERTIFICATE_PASSWORD_FILE': None,
+                                                   'VAULT_ENV_JWT_MOUNT': 'jwt', 'VAULT_TOKEN': None})
+                self.assertTrue(os.path.exists(pw))
+                self.assertEqual(v.paths()[-1], 'auth/token/revoke-self', 'revoked before exec')
+        finally:
+            shutil.rmtree(d)
+
+    def test_keep_token_leaves_the_variables(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role()) as v:
+            code, out, err = run([sys.executable, MODULE, '--keep-token', '--', sys.executable, '-c',
+                                  'import os; print(os.environ["VAULT_CLIENT_CERTIFICATE_PATH"] + "|" + os.environ.get("VAULT_TOKEN", ""))'],
+                                 cert_child_env(v.addr))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.strip(), '%s|' % RSA_PEM, 'the session token never reaches the command')
+
+    def test_secret_id_beside_certificate_is_a_config_error(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role()) as v:
+            code, _, err = run([sys.executable, MODULE, '--', 'true'], cert_child_env(v.addr, VAULT_SECRET_ID='s'))
+            self.assertEqual(code, 78)
+            self.assertIn('AppRole login takes one or the other', err)
+            self.assertEqual(v.requests, [])
+
+    def test_flags_and_no_password_flag(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role(mount='ci/jwt')) as v:
+            env = cert_child_env(v.addr)
+            env.pop('VAULT_CLIENT_CERTIFICATE_PATH')
+            code, out, err = run([sys.executable, MODULE, '--client-certificate-path', RSA_PEM, '--client-key-path', RSA_PEM, '--jwt-mount', 'ci/jwt',
+                                  '--', sys.executable, '-c', 'import os; print(os.environ["DB_PASSWORD"])'], env)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.strip(), 's3cr3t')
+        code, _, err = run([sys.executable, MODULE, '--client-certificate-password', 'x', '--', 'true'], dict(os.environ))
+        self.assertEqual(code, 78)
+        self.assertIn('no --client-certificate-password option', err)
+
+    def test_check_line(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role()) as v:
+            code, out, err = run([sys.executable, MODULE, 'check'], cert_child_env(v.addr))
+            self.assertEqual(code, 0, err)
+            import calendar
+            days = int((calendar.timegm((2060, 1, 1, 0, 0, 0)) - time.time()) // 86400)
+            self.assertIn('auth     certificate (role_id role-123..., cert TRPxIPG0..., expires 2060-01-01, %d days, mount jwt; '
+                          'session revoked after reading)\n' % days, out)
+            self.assertEqual(err, '')
+            self.assertEqual(v.paths()[-1], 'auth/token/revoke-self')
+
+    def test_failed_revoke_only_warns(self):
+        routes = dict(APPROLE_ROUTES, **{'auth/token/revoke-self': {'status': 500, 'body': {'errors': []}}})
+        with FakeVault(routes, token=TOKEN, jwt=jwt_role()) as v:
+            env = cert_env(v.addr)
+            with captured_stderr() as err:
+                V.load(env=env, **FAST)
+            self.assertEqual(env['DB_PASSWORD'], 's3cr3t')
+            self.assertEqual(err.getvalue(), '[vault-env-loader] Could not revoke the certificate login session (HTTP 500); it expires by itself.\n')
+
+    def test_token_wins_and_certificate_variables_are_left(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            env = base_env(v.addr, VAULT_ENV_IMPORT='database', VAULT_ROLE_ID='r', VAULT_CLIENT_CERTIFICATE_PATH=RSA_PEM)
+            with captured_stderr() as err:
+                V.load(env=env, **FAST)
+            self.assertEqual((env['DB_PASSWORD'], env['VAULT_CLIENT_CERTIFICATE_PATH']), ('s3cr3t', RSA_PEM))
+            self.assertEqual(err.getvalue(), '[vault-env-loader] VAULT_TOKEN is set, so VAULT_ROLE_ID / VAULT_SECRET_ID / VAULT_CLIENT_CERTIFICATE_PATH are ignored.\n')
+
+    def test_client_assertion(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN, jwt=jwt_role()) as v:
+            jwt = V.client_assertion(role_id='role-123', certificate_path=RSA_PEM, vault_addr=v.addr + '/')
+            import urllib.request
+            req = urllib.request.Request(v.addr + '/v1/auth/jwt/login', data=json.dumps({'role': 'role-123', 'jwt': jwt}).encode(), method='POST')
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.getcode(), 200)
+        with self.assertRaisesRegex(V.VaultEnvError, 'needs role_id'):
+            V.client_assertion(certificate_path=RSA_PEM, vault_addr='https://v.example.com')
+        with self.assertRaisesRegex(V.VaultEnvError, 'is encrypted'):
+            V.client_assertion(role_id='r', certificate_path=os.path.join(FIXTURES, 'encrypted.pem'), vault_addr='https://v.example.com')
+        jwt = V.client_assertion(role_id='r', certificate_path=os.path.join(FIXTURES, 'encrypted.pem'), password='fixture-password',
+                                 vault_addr='https://V.example.com:443', mount='ci/jwt')
+        import base64
+        p = jwt.split('.')[1]
+        self.assertEqual(json.loads(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4)))['aud'], 'https://v.example.com/v1/auth/ci/jwt/login')
+
+
+class CertificateWithoutCryptography(unittest.TestCase):
+    """Runs everywhere: the base package stays usable without the [cert] extra."""
+
+    def test_missing_cryptography_exits_78_with_the_install_hint_and_sends_nothing(self):
+        with FakeVault(APPROLE_ROUTES, token=TOKEN) as v:
+            code, _, err = run([sys.executable, '-c', 'import sys; sys.modules["cryptography"] = None; sys.path.insert(0, %r); '
+                                'import vault_env_loader as V; sys.exit(V.main(["--", "true"]))' % os.path.join(HERE, '..')],
+                               cert_child_env(v.addr))
+            self.assertEqual(code, 78)
+            self.assertEqual(err, '[vault-env-loader] %s\n' % V.CERT_NEEDS_CRYPTOGRAPHY)
+            self.assertIn('pip install "vault-env-loader[cert]"', err)
+            self.assertEqual(v.requests, [])
+
+    def test_other_methods_never_import_it(self):
+        with FakeVault(ROUTES, token=TOKEN) as v:
+            code, out, err = run([sys.executable, '-c', 'import sys; sys.modules["cryptography"] = None; sys.path.insert(0, %r); '
+                                  'import vault_env_loader as V; sys.exit(V.main(["--", sys.executable, "-c", "import os; print(os.environ[\'DB_PASSWORD\'])"]))'
+                                  % os.path.join(HERE, '..')], child_env(v.addr))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.strip(), 's3cr3t')
+
+
+# ---------------------------------------------------------------------------
 # VAULT_ENV_ENABLED
 
 def line(message):
