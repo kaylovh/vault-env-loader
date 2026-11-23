@@ -4,10 +4,10 @@ Load secrets from HashiCorp Vault's KV engine into environment variables **befor
 
 | Language | Package | Status |
 |---|---|---|
-| Node.js | [`node/`](./node) — `npm install vault-env-loader` | 0.3.0 |
-| Python | [`python/`](./python) — `pip install vault-env-loader` | 0.3.0 |
+| Node.js | [`node/`](./node) — `npm install vault-env-loader` | 0.4.0 |
+| Python | [`python/`](./python) — `pip install vault-env-loader` (certificate login: `vault-env-loader[cert]`) | 0.4.0 |
 
-Both implementations follow one behaviour contract — import syntax, variable naming, precedence, failure handling — checked by the shared cases in [`spec/cases.json`](./spec/cases.json).
+Both implementations follow one behaviour contract — import syntax, variable naming, precedence, failure handling, authentication (token, AppRole secret ID or certificate) — checked by the shared cases in [`spec/cases.json`](./spec/cases.json). The certificates and keys in [`spec/fixtures`](./spec/fixtures) are test fixtures, used nowhere else.
 
 ```bash
 VAULT_ADDR=https://vault.example.com

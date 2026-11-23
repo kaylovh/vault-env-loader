@@ -11,6 +11,7 @@ Load secrets from HashiCorp Vault's KV engine into environment variables **befor
 - **Spring Cloud Vault style imports**: `vault://secret/my-app/prod/database`.
 - **The token stays out of your application**: `VAULT_TOKEN` is removed from the environment it sees.
 - **Token or AppRole**: with AppRole it logs in once per start, reads, and revokes the session before the application runs.
+- **Or a certificate**: with a role ID and `VAULT_CLIENT_CERTIFICATE_PATH` it signs a short-lived JWT with the private key instead of sending a secret ID (`pip install "vault-env-loader[cert]"`).
 - **An explicit switch**: `VAULT_ENV_ENABLED=false` runs the application without Vault (and without the credentials); `true` makes Vault required.
 - Works with HashiCorp Vault (KV v1 and v2, detected automatically) and Vault-compatible servers.
 
@@ -28,6 +29,7 @@ Configure it where you deploy:
 VAULT_ADDR=https://vault.example.com
 VAULT_TOKEN=hvs.xxxxx                  # or VAULT_TOKEN_FILE=/run/secrets/vault-token
 #   or AppRole: VAULT_ROLE_ID=... VAULT_SECRET_ID_FILE=/run/secrets/vault-secret-id
+#   or a certificate: VAULT_ROLE_ID=... VAULT_CLIENT_CERTIFICATE_PATH=/run/secrets/vault/app.pem
 VAULT_ENV_IMPORT="vault://secret/order-service/prod/database, vault://secret/order-service/prod/redis?prefix=REDIS_"
 ```
 
